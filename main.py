@@ -1,7 +1,6 @@
 import os
 import json
 import uuid
-import re
 from datetime import datetime, timezone
 from typing import Optional, Dict, Any, Tuple, List
 
@@ -49,7 +48,7 @@ if SUPABASE_URL and SUPABASE_KEY:
 class BrainRequest(BaseModel):
     student_id: Optional[str] = "demo"
 
-    # Curriculum routing (Multi-subject ready)
+    # Curriculum routing
     board: Optional[str] = "ICSE"
     grade: Optional[int] = 6
     subject: Optional[str] = "Science"
@@ -61,11 +60,8 @@ class BrainRequest(BaseModel):
     student_input: str
 
     # Signals:
-    # - emotion: confused/ok/happy/...
-    # - engagement: low/medium/high
     # - actor: student/parent/other/unknown
-    # - voice_id: optional
-    # - reply_to_turn_id: optional
+    # - emotion, engagement, voice_id, reply_to_turn_id, etc.
     signals: Optional[Dict[str, Any]] = {}
 
     # Optional brain override
@@ -88,7 +84,6 @@ class QuizAnswerRequest(BaseModel):
     session_id: str
     student_id: str
     answer: str
-
 
 # ============================================================
 # SYSTEM MASTER PROMPT (TEACHER BRAIN)
@@ -143,6 +138,27 @@ Prefer:
 4) quiz
 
 ====================================================
+ACTOR ROUTING
+====================================================
+You will receive signals.actor.
+
+If signals.actor == "parent":
+- Use respectful, polite tone.
+- Give parent-friendly guidance (routines, communication tips, gentle motivation).
+- Do NOT test the parent like a student.
+- micro_q should be a parent question (routine/observation/goal).
+- Keep it practical, short, and supportive.
+- Still follow safety boundaries (no diagnosis/therapy/medical claims).
+
+If signals.actor == "student":
+- Teach the concept clearly.
+- Ask the student micro-question (one).
+- You may be firm/bold if needed but never rude or shaming.
+
+If signals.actor == "other" or "unknown":
+- Ask a gentle clarification in the micro_q.
+
+====================================================
 SAFETY BOUNDARIES
 ====================================================
 - No diagnosis.
@@ -157,7 +173,6 @@ MEMORY RULE
 Always update memory_update safely.
 Confidence and stress change max ±10 per turn (non-clinical).
 """.strip()
-
 
 # ============================================================
 # UTILS
@@ -321,7 +336,6 @@ def fetch_explain_chunks(board: str, grade: int, subject: str, chapter: str, con
 
 def fetch_quiz_chunk(board: str, grade: int, subject: str, chapter: str, concept: str, language: str, difficulty: int):
     _require_supabase()
-    # exact match first
     res = (
         supabase.table("curriculum_chunks")
         .select("*")
@@ -339,7 +353,6 @@ def fetch_quiz_chunk(board: str, grade: int, subject: str, chapter: str, concept
     if res.data:
         return res.data[0]
 
-    # closest difficulty
     for d in [difficulty - 1, difficulty + 1, difficulty - 2, difficulty + 2]:
         if d < 1 or d > 5:
             continue
@@ -361,8 +374,10 @@ def fetch_quiz_chunk(board: str, grade: int, subject: str, chapter: str, concept
             return res2.data[0]
     return None
 
-def save_quiz_chunk(board: str, grade: int, subject: str, chapter: str, concept: str, language: str, difficulty: int,
-                    question_obj: Dict[str, Any], source: str = "llm") -> None:
+def save_quiz_chunk(
+    board: str, grade: int, subject: str, chapter: str, concept: str,
+    language: str, difficulty: int, question_obj: Dict[str, Any], source: str = "llm"
+) -> None:
     _require_supabase()
 
     qid = (question_obj.get("question_id") or "").strip()
@@ -385,7 +400,6 @@ def save_quiz_chunk(board: str, grade: int, subject: str, chapter: str, concept:
         "updated_at": utc_now_iso(),
     }
 
-    # soft de-dup by exact row match
     existing = (
         supabase.table("curriculum_chunks")
         .select("id")
@@ -479,7 +493,6 @@ def update_mastery(brain: Dict[str, Any], chapter: str, concept: str, delta: int
         mastery = {}
 
     key = concept_key(chapter, concept) or "Unknown::Unknown"
-
     cur = mastery.get(key) or {}
     if not isinstance(cur, dict):
         cur = {}
@@ -511,6 +524,37 @@ def update_mastery(brain: Dict[str, Any], chapter: str, concept: str, delta: int
     brain["mastery"] = mastery
     return brain
 
+def compute_mastery_rollups(brain: Dict[str, Any], subject: str, chapter: str) -> Dict[str, Any]:
+    mastery = brain.get("mastery") or {}
+    if not isinstance(mastery, dict) or not mastery:
+        brain["mastery_rollup"] = {"subject": subject, "chapter": chapter, "subject_avg": 0, "chapter_avg": 0, "concepts_count": 0}
+        return brain
+
+    scores_all: List[int] = []
+    scores_chapter: List[int] = []
+
+    for k, v in mastery.items():
+        if not isinstance(v, dict):
+            continue
+        s = v.get("score")
+        if not isinstance(s, (int, float)):
+            continue
+        scores_all.append(int(s))
+        if str(k).startswith(f"{chapter}::"):
+            scores_chapter.append(int(s))
+
+    subject_avg = int(sum(scores_all) / len(scores_all)) if scores_all else 0
+    chapter_avg = int(sum(scores_chapter) / len(scores_chapter)) if scores_chapter else 0
+
+    brain["mastery_rollup"] = {
+        "subject": subject,
+        "chapter": chapter,
+        "subject_avg": subject_avg,
+        "chapter_avg": chapter_avg,
+        "concepts_count": len(scores_all),
+    }
+    return brain
+
 # ============================================================
 # LEVEL-BASED QUIZ DIFFICULTY (1..5)
 # ============================================================
@@ -518,7 +562,6 @@ def update_mastery(brain: Dict[str, Any], chapter: str, concept: str, delta: int
 def pick_quiz_difficulty(student_level: int, brain: Dict[str, Any]) -> int:
     lvl = clamp_int(student_level or 2, 1, 5)
 
-    # concept mastery (rough average)
     mastery_map = brain.get("mastery") or {}
     avg_mastery = None
     if isinstance(mastery_map, dict) and mastery_map:
@@ -535,7 +578,6 @@ def pick_quiz_difficulty(student_level: int, brain: Dict[str, Any]) -> int:
     conf = int(conf) if isinstance(conf, (int, float)) else None
 
     diff = lvl
-
     if avg_mastery is not None and avg_mastery < 40:
         diff -= 1
     elif avg_mastery is not None and avg_mastery > 75:
@@ -554,11 +596,7 @@ def pick_quiz_difficulty(student_level: int, brain: Dict[str, Any]) -> int:
 
 @app.get("/")
 def root():
-    return {
-        "ok": True,
-        "service": "leaflore-brain",
-        "message": "API is running. Use /docs or POST /respond"
-    }
+    return {"ok": True, "service": "leaflore-brain", "message": "API is running. Use /docs or POST /respond"}
 
 @app.get("/health")
 def health():
@@ -586,25 +624,23 @@ def set_student_brain(student_id: str, brain: Dict[str, Any]):
 def quiz_start(req: QuizStartRequest):
     try:
         _require_supabase()
-
         if not req.student_ids:
             raise HTTPException(status_code=400, detail="student_ids required")
 
         rep_id = req.representative_student_id or req.student_ids[0]
         rep_brain = load_brain(rep_id)
 
-        # Determine student level (override > stored > default)
         stored_level = None
         try:
-            bd = (rep_brain.get("brain_data") or {})
-            stored_level = (bd.get("student_level") if isinstance(bd, dict) else None)
+            bd = rep_brain.get("brain_data") or {}
+            if isinstance(bd, dict):
+                stored_level = bd.get("student_level")
         except Exception:
             stored_level = None
 
         level = req.student_level or stored_level or 2
         difficulty = pick_quiz_difficulty(int(level), rep_brain)
 
-        # 1) Try DB quiz chunk
         row = fetch_quiz_chunk(req.board, req.grade, req.subject, req.chapter, req.concept, req.language, difficulty)
         question_obj = None
 
@@ -612,7 +648,6 @@ def quiz_start(req: QuizStartRequest):
             try:
                 question_obj = json.loads(row["chunk_text"])
             except Exception:
-                # fallback plain text
                 question_obj = {
                     "question": row["chunk_text"],
                     "options": ["A", "B", "C", "D"],
@@ -621,13 +656,11 @@ def quiz_start(req: QuizStartRequest):
                     "question_id": str(row.get("id") or uuid.uuid4())
                 }
 
-        # 2) Fallback LLM from explain chunk(s)
         if not question_obj:
             explain_chunks = fetch_explain_chunks(req.board, req.grade, req.subject, req.chapter, req.concept, req.language, limit=4)
             explain_text = "\n".join([c.get("chunk_text", "") for c in explain_chunks if c.get("chunk_text")]) or f"{req.concept} in {req.chapter}"
             question_obj = generate_quiz_via_llm(explain_text, difficulty, req.language)
 
-            # ✅ Auto-save generated quiz
             try:
                 save_quiz_chunk(req.board, req.grade, req.subject, req.chapter, req.concept, req.language, difficulty, question_obj, source="llm")
             except Exception:
@@ -652,29 +685,44 @@ def quiz_start(req: QuizStartRequest):
 
         supabase.table("classroom_sessions").insert(payload).execute()
 
-        safe_question = dict(question_obj)
-        safe_question.pop("answer_key", None)
+        safe_q = dict(question_obj)
+        safe_q.pop("answer_key", None)
 
-        return {"ok": True, "session_id": session_id, "difficulty": difficulty, "question": safe_question}
+        return {"ok": True, "session_id": session_id, "difficulty": difficulty, "question": safe_q}
 
     except HTTPException:
         raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
+@app.get("/quiz/{session_id}")
+def quiz_get(session_id: str):
+    try:
+        _require_supabase()
+        res = supabase.table("classroom_sessions").select("*").eq("session_id", session_id).limit(1).execute()
+        if not res.data:
+            raise HTTPException(status_code=404, detail="session not found")
+        s = res.data[0] or {}
+        q = s.get("current_question") or {}
+        if isinstance(q, dict):
+            q.pop("answer_key", None)
+        return {
+            "session_id": session_id,
+            "difficulty": s.get("difficulty"),
+            "scores": s.get("scores") or {},
+            "question": q,
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
 
 @app.post("/quiz/answer")
 def quiz_answer(req: QuizAnswerRequest):
     try:
         _require_supabase()
 
-        res = (
-            supabase.table("classroom_sessions")
-            .select("*")
-            .eq("session_id", req.session_id)
-            .limit(1)
-            .execute()
-        )
+        res = supabase.table("classroom_sessions").select("*").eq("session_id", req.session_id).limit(1).execute()
         if not res.data:
             raise HTTPException(status_code=404, detail="session_id not found")
 
@@ -701,10 +749,7 @@ def quiz_answer(req: QuizAnswerRequest):
             st["correct"] = int(st.get("correct", 0)) + 1
         scores[req.student_id] = st
 
-        supabase.table("classroom_sessions").update({
-            "scores": scores,
-            "updated_at": utc_now_iso(),
-        }).eq("session_id", req.session_id).execute()
+        supabase.table("classroom_sessions").update({"scores": scores, "updated_at": utc_now_iso()}).eq("session_id", req.session_id).execute()
 
         # optional attempt log
         try:
@@ -762,10 +807,9 @@ def respond(req: BrainRequest):
             brain = load_brain(student_id)
 
         brain = ensure_turnlock(brain)
-
         actor = get_actor(req.signals or {})
 
-        # 2) SOFT TURN-LOCK GATE (student asked -> parent/other answers shouldn't hijack)
+        # 2) SOFT TURN-LOCK GATE
         if not is_actor_allowed(brain, actor):
             lock = brain["brain_data"]["telemetry"]["turn_lock"]
             expected = lock.get("expected_actor") or "student"
@@ -791,10 +835,10 @@ def respond(req: BrainRequest):
                 }
             }
 
-        # If allowed actor answered, clear lock so conversation continues
+        # allowed actor answered -> clear lock
         brain = clear_turn_lock(brain)
 
-        # 3) Fetch curriculum explain chunks (if Supabase present)
+        # 3) Fetch curriculum explain chunks
         chunks = []
         if supabase is not None:
             chunks = fetch_explain_chunks(
@@ -807,7 +851,7 @@ def respond(req: BrainRequest):
                 limit=6
             )
 
-        # 4) Build context (JSON input to LLM)
+        # 4) Build LLM input context
         user_context = {
             "board": req.board,
             "grade": req.grade,
@@ -832,18 +876,17 @@ def respond(req: BrainRequest):
 
         content = (response.choices[0].message.content or "").strip()
 
-        # 5) Strict JSON parse
+        # 5) Strict JSON parse + required keys
         parsed = json.loads(content)
-
         required_keys = {"text", "mode", "next_action", "micro_q", "ui_hint", "memory_update"}
         if not required_keys.issubset(parsed.keys()):
             raise ValueError(f"Missing required keys in AI response. Got keys={list(parsed.keys())}")
 
-        # 6) Merge AI memory_update into brain (deep)
+        # 6) Merge memory_update into brain (deep)
         memory_update = parsed.get("memory_update") or {}
         new_brain = deep_merge(brain, memory_update)
 
-        # 7) Auto mastery + auto clamp confidence/stress
+        # 7) Auto mastery + conf/stress clamp
         delta, reason = estimate_mastery_delta(req.student_input, req.signals or {})
         new_brain = update_mastery(new_brain, req.chapter or "", req.concept or "", delta)
 
@@ -856,13 +899,21 @@ def respond(req: BrainRequest):
         new_brain["confidence_score"] = conf
         new_brain["stress_score"] = stress
 
-        # 8) Update brain_data telemetry + set lock for next micro_q
+        # 8) Mastery rollups (Subject + Chapter)
+        new_brain = compute_mastery_rollups(new_brain, req.subject or "", req.chapter or "")
+
+        # 9) Telemetry + set lock for next turn
         new_brain = ensure_turnlock(new_brain)
         bd = new_brain.get("brain_data") or {}
+        if not isinstance(bd, dict):
+            bd = {}
         bd.setdefault("version", "v2")
         bd["last_interaction_at"] = utc_now_iso()
 
-        tel = (bd.get("telemetry") or {})
+        tel = bd.get("telemetry") or {}
+        if not isinstance(tel, dict):
+            tel = {}
+
         tel["last_ai"] = {
             "mode": parsed.get("mode"),
             "next_action": parsed.get("next_action"),
@@ -873,14 +924,15 @@ def respond(req: BrainRequest):
         bd["telemetry"] = tel
         new_brain["brain_data"] = bd
 
-        # Soft lock default: student gets the next micro_q unless actor is parent (then lock parent chat)
-        incoming_actor = actor
-        if incoming_actor == "parent":
+        # Soft lock default:
+        # - parent => lock parent chat
+        # - student/unknown/other => lock student micro_q
+        if actor == "parent":
             new_brain = set_turn_lock(new_brain, expected_actor="parent", purpose="parent_chat")
         else:
             new_brain = set_turn_lock(new_brain, expected_actor="student", purpose="micro_q")
 
-        # 9) Persist
+        # 10) Persist brain
         if supabase is not None:
             save_brain(student_id, new_brain)
 
@@ -889,5 +941,5 @@ def respond(req: BrainRequest):
     except HTTPException:
         raise
     except Exception as e:
-        # REAL ERROR OUTPUT (for debugging)
+        # show real error
         raise HTTPException(status_code=500, detail=str(e))

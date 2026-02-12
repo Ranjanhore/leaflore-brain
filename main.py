@@ -123,32 +123,32 @@ Confidence and stress change max ±10 per turn.
 # HELPERS (SUPABASE)
 # ============================================================
 
+from typing import Dict, Any
+from fastapi import HTTPException
+
 def _require_supabase():
     if supabase is None:
         raise HTTPException(status_code=500, detail="Supabase is not configured (missing env vars).")
 
+META_KEYS = {"id", "student_id", "updated_at"}
 
 def load_brain(student_id: str) -> Dict[str, Any]:
     _require_supabase()
-    res = supabase.table("student_brain").select("brain_data").eq("student_id", student_id).execute()
-    if res.data and len(res.data) > 0 and res.data[0].get("brain_data") is not None:
-        return res.data[0]["brain_data"]
+    res = supabase.table("student_brain").select("*").eq("student_id", student_id).limit(1).execute()
+    if res.data and len(res.data) > 0:
+        row = res.data[0] or {}
+        # return only "brain" fields (exclude metadata)
+        return {k: v for k, v in row.items() if k not in META_KEYS and v is not None}
     return {}
-
 
 def save_brain(student_id: str, brain_data: Dict[str, Any]) -> None:
     _require_supabase()
-    supabase.table("student_brain").upsert(
-        {"student_id": student_id, "brain_data": brain_data}
-    ).execute()
-
+    if not isinstance(brain_data, dict):
+        brain_data = {}
+    payload = {"student_id": student_id, **brain_data}
+    supabase.table("student_brain").upsert(payload).execute()
 
 def merge_brain(existing: Dict[str, Any], memory_update: Dict[str, Any]) -> Dict[str, Any]:
-    """
-    Simple merge strategy:
-    - Overlay keys from memory_update onto existing brain.
-    - If you later want deep-merge for mastery/personality, we can upgrade this.
-    """
     if not isinstance(existing, dict):
         existing = {}
     if not isinstance(memory_update, dict):
@@ -156,6 +156,7 @@ def merge_brain(existing: Dict[str, Any], memory_update: Dict[str, Any]) -> Dict
     merged = dict(existing)
     merged.update(memory_update)
     return merged
+
 
 
 # ============================================================

@@ -2,10 +2,11 @@ import os
 import json
 from typing import Optional, Dict, Any
 
-from fastapi import FastAPI
+from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from openai import OpenAI
+from supabase import create_client, Client
 
 # ============================================================
 # APP SETUP
@@ -22,21 +23,38 @@ app.add_middleware(
 )
 
 # ============================================================
-# OPENAI CLIENT
+# CLIENTS
 # ============================================================
 
-client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+
+SUPABASE_URL = os.getenv("SUPABASE_URL")
+SUPABASE_KEY = os.getenv("SUPABASE_SERVICE_ROLE_KEY")
+
+if not OPENAI_API_KEY:
+    raise RuntimeError("Missing OPENAI_API_KEY env var")
+
+if not SUPABASE_URL or not SUPABASE_KEY:
+    # Keep app running even if Supabase missing; endpoints will error when used.
+    supabase = None
+else:
+    supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
+
+client = OpenAI(api_key=OPENAI_API_KEY)
+
 
 # ============================================================
 # REQUEST MODEL
 # ============================================================
 
 class BrainRequest(BaseModel):
+    student_id: Optional[str] = "demo"
     chapter: Optional[str] = ""
     concept: Optional[str] = ""
     student_input: str
     signals: Optional[Dict[str, Any]] = {}
     brain: Optional[Dict[str, Any]] = {}
+
 
 # ============================================================
 # SYSTEM MASTER PROMPT
@@ -100,6 +118,46 @@ Always update memory_update safely.
 Confidence and stress change max ±10 per turn.
 """
 
+
+# ============================================================
+# HELPERS (SUPABASE)
+# ============================================================
+
+def _require_supabase():
+    if supabase is None:
+        raise HTTPException(status_code=500, detail="Supabase is not configured (missing env vars).")
+
+
+def load_brain(student_id: str) -> Dict[str, Any]:
+    _require_supabase()
+    res = supabase.table("student_brain").select("brain_data").eq("student_id", student_id).execute()
+    if res.data and len(res.data) > 0 and res.data[0].get("brain_data") is not None:
+        return res.data[0]["brain_data"]
+    return {}
+
+
+def save_brain(student_id: str, brain_data: Dict[str, Any]) -> None:
+    _require_supabase()
+    supabase.table("student_brain").upsert(
+        {"student_id": student_id, "brain_data": brain_data}
+    ).execute()
+
+
+def merge_brain(existing: Dict[str, Any], memory_update: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Simple merge strategy:
+    - Overlay keys from memory_update onto existing brain.
+    - If you later want deep-merge for mastery/personality, we can upgrade this.
+    """
+    if not isinstance(existing, dict):
+        existing = {}
+    if not isinstance(memory_update, dict):
+        memory_update = {}
+    merged = dict(existing)
+    merged.update(memory_update)
+    return merged
+
+
 # ============================================================
 # ROOT & HEALTH
 # ============================================================
@@ -112,9 +170,27 @@ def root():
         "message": "API is running. Use /docs or POST /respond"
     }
 
+
 @app.get("/health")
 def health():
     return {"ok": True}
+
+
+# ============================================================
+# BRAIN STORAGE ENDPOINTS
+# ============================================================
+
+@app.get("/student/{student_id}/brain")
+def get_student_brain(student_id: str):
+    brain = load_brain(student_id)
+    return {"student_id": student_id, "brain": brain}
+
+
+@app.post("/student/{student_id}/brain")
+def set_student_brain(student_id: str, brain: Dict[str, Any]):
+    save_brain(student_id, brain)
+    return {"ok": True, "student_id": student_id}
+
 
 # ============================================================
 # MAIN AI ENDPOINT
@@ -122,14 +198,20 @@ def health():
 
 @app.post("/respond")
 def respond(req: BrainRequest):
-
     try:
+        student_id = (req.student_id or "demo").strip()
+
+        # 1) Load persisted brain if request brain is empty
+        brain = req.brain or {}
+        if (not brain) and supabase is not None:
+            brain = load_brain(student_id)
+
         user_context = f"""
 Chapter: {req.chapter}
 Concept: {req.concept}
 Student Input: {req.student_input}
-Signals: {json.dumps(req.signals)}
-Brain Memory: {json.dumps(req.brain)}
+Signals: {json.dumps(req.signals, ensure_ascii=False)}
+Brain Memory (student profile): {json.dumps(brain, ensure_ascii=False)}
 """
 
         response = client.chat.completions.create(
@@ -141,9 +223,9 @@ Brain Memory: {json.dumps(req.brain)}
             ]
         )
 
-        content = response.choices[0].message.content.strip()
+        content = (response.choices[0].message.content or "").strip()
 
-        # Enforce strict JSON output
+        # 2) Enforce strict JSON output
         parsed = json.loads(content)
 
         required_keys = {
@@ -158,9 +240,18 @@ Brain Memory: {json.dumps(req.brain)}
         if not required_keys.issubset(parsed.keys()):
             raise ValueError("Missing required keys in AI response")
 
+        # 3) Persist memory_update into Supabase (merge into brain)
+        memory_update = parsed.get("memory_update") or {}
+        if supabase is not None:
+            new_brain = merge_brain(brain, memory_update)
+            save_brain(student_id, new_brain)
+
+        # Optional: return updated brain too (commented to keep schema strict)
+        # parsed["brain"] = new_brain
+
         return parsed
 
-    except Exception as e:
+    except Exception:
         return {
             "text": "I'm ready to help. Let’s take this step by step.",
             "mode": "support",

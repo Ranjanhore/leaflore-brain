@@ -1,6 +1,5 @@
 import os
 import json
-import logging
 from typing import Optional, Dict, Any
 
 from fastapi import FastAPI, HTTPException
@@ -9,12 +8,6 @@ from pydantic import BaseModel
 from openai import OpenAI
 from supabase import create_client, Client
 
-# ============================================================
-# LOGGING
-# ============================================================
-
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger(__name__)
 
 # ============================================================
 # APP SETUP
@@ -30,8 +23,9 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+
 # ============================================================
-# ENV + CLIENTS
+# CLIENTS
 # ============================================================
 
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
@@ -39,15 +33,15 @@ SUPABASE_URL = os.getenv("SUPABASE_URL")
 SUPABASE_KEY = os.getenv("SUPABASE_SERVICE_ROLE_KEY")
 
 if not OPENAI_API_KEY:
-    raise RuntimeError("Missing OPENAI_API_KEY")
+    raise RuntimeError("Missing OPENAI_API_KEY env var")
 
 client = OpenAI(api_key=OPENAI_API_KEY)
 
-supabase: Optional[Client] = None
 if SUPABASE_URL and SUPABASE_KEY:
-    supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
+    supabase: Optional[Client] = create_client(SUPABASE_URL, SUPABASE_KEY)
 else:
-    logger.warning("Supabase not configured. Brain persistence disabled.")
+    supabase = None
+
 
 # ============================================================
 # REQUEST MODEL
@@ -61,14 +55,17 @@ class BrainRequest(BaseModel):
     signals: Optional[Dict[str, Any]] = {}
     brain: Optional[Dict[str, Any]] = {}
 
+
 # ============================================================
 # SYSTEM PROMPT
 # ============================================================
 
 SYSTEM_PROMPT = """
-You are Leaflore NeuroMentor — elite, calm, intelligent science mentor.
+You are Leaflore NeuroMentor — an elite, warm, calm, highly intelligent science teacher.
 
-STRICT RULES:
+You are NOT a medical doctor.
+No diagnosis. No therapy language. No psychiatric labels.
+
 Return ONLY valid JSON with EXACT keys:
 
 text
@@ -80,25 +77,28 @@ memory_update
 
 No markdown.
 No extra keys.
-One micro-question only.
 
-No diagnosis. No therapy language. No medical claims.
-Confidence & stress changes max ±10 per turn.
+Always end with exactly ONE micro-question.
+
+Confidence and stress must change max ±10 per turn.
 """
 
+
 # ============================================================
-# SUPABASE HELPERS (JSONB brain_data column)
+# SUPABASE HELPERS
 # ============================================================
 
 def _require_supabase():
     if supabase is None:
-        raise HTTPException(status_code=500, detail="Supabase not configured")
+        raise HTTPException(
+            status_code=500,
+            detail="Supabase is not configured (missing env vars)."
+        )
 
 def load_brain(student_id: str) -> Dict[str, Any]:
     _require_supabase()
     res = (
-        supabase
-        .table("student_brain")
+        supabase.table("student_brain")
         .select("brain_data")
         .eq("student_id", student_id)
         .limit(1)
@@ -112,21 +112,19 @@ def load_brain(student_id: str) -> Dict[str, Any]:
 
 def save_brain(student_id: str, brain_data: Dict[str, Any]) -> None:
     _require_supabase()
-
     if not isinstance(brain_data, dict):
         brain_data = {}
 
-    payload = {
-        "student_id": student_id,
-        "brain_data": brain_data
-    }
-
-    supabase.table("student_brain").upsert(payload).execute()
+    supabase.table("student_brain").upsert(
+        {
+            "student_id": student_id,
+            "brain_data": brain_data
+        }
+    ).execute()
 
 def merge_brain(existing: Dict[str, Any], memory_update: Dict[str, Any]) -> Dict[str, Any]:
     if not isinstance(existing, dict):
         existing = {}
-
     if not isinstance(memory_update, dict):
         memory_update = {}
 
@@ -134,8 +132,53 @@ def merge_brain(existing: Dict[str, Any], memory_update: Dict[str, Any]) -> Dict
     merged.update(memory_update)
     return merged
 
+
 # ============================================================
-# ROOT + HEALTH
+# CONFIDENCE AUTO-CLAMPING
+# ============================================================
+
+def _clamp(n: int, lo: int = 0, hi: int = 100) -> int:
+    return max(lo, min(hi, int(n)))
+
+def _limit_delta(new_val: int, old_val: int, max_delta: int = 10) -> int:
+    if new_val > old_val + max_delta:
+        return old_val + max_delta
+    if new_val < old_val - max_delta:
+        return old_val - max_delta
+    return new_val
+
+def apply_score_clamp(existing: Dict[str, Any], memory_update: Dict[str, Any]) -> Dict[str, Any]:
+    if not isinstance(existing, dict):
+        existing = {}
+    if not isinstance(memory_update, dict):
+        memory_update = {}
+
+    out = dict(memory_update)
+
+    for key in ("confidence_score", "stress_score"):
+        if key in memory_update:
+            try:
+                new_raw = int(memory_update[key])
+            except Exception:
+                continue
+
+            old_raw = existing.get(key, 50)
+
+            try:
+                old_raw = int(old_raw)
+            except Exception:
+                old_raw = 50
+
+            new_raw = _clamp(new_raw)
+            old_raw = _clamp(old_raw)
+
+            out[key] = _limit_delta(new_raw, old_raw)
+
+    return out
+
+
+# ============================================================
+# ROOT & HEALTH
 # ============================================================
 
 @app.get("/")
@@ -143,12 +186,13 @@ def root():
     return {
         "ok": True,
         "service": "leaflore-brain",
-        "message": "API is running"
+        "message": "API is running. Use /docs or POST /respond"
     }
 
 @app.get("/health")
 def health():
     return {"ok": True}
+
 
 # ============================================================
 # BRAIN ENDPOINTS
@@ -164,6 +208,7 @@ def set_student_brain(student_id: str, brain: Dict[str, Any]):
     save_brain(student_id, brain)
     return {"ok": True, "student_id": student_id}
 
+
 # ============================================================
 # MAIN AI ENDPOINT
 # ============================================================
@@ -173,7 +218,6 @@ def respond(req: BrainRequest):
     try:
         student_id = (req.student_id or "demo").strip()
 
-        # Load existing brain if not provided
         brain = req.brain or {}
         if not brain and supabase:
             brain = load_brain(student_id)
@@ -182,8 +226,8 @@ def respond(req: BrainRequest):
 Chapter: {req.chapter}
 Concept: {req.concept}
 Student Input: {req.student_input}
-Signals: {json.dumps(req.signals)}
-Brain Memory: {json.dumps(brain)}
+Signals: {json.dumps(req.signals, ensure_ascii=False)}
+Brain Memory: {json.dumps(brain, ensure_ascii=False)}
 """
 
         response = client.chat.completions.create(
@@ -191,17 +235,13 @@ Brain Memory: {json.dumps(brain)}
             temperature=0.6,
             messages=[
                 {"role": "system", "content": SYSTEM_PROMPT},
-                {"role": "user", "content": user_context},
-            ],
+                {"role": "user", "content": user_context}
+            ]
         )
 
         content = (response.choices[0].message.content or "").strip()
 
-        try:
-            parsed = json.loads(content)
-        except json.JSONDecodeError:
-            logger.error("Model returned invalid JSON")
-            raise HTTPException(status_code=500, detail="Model returned invalid JSON")
+        parsed = json.loads(content)
 
         required_keys = {
             "text",
@@ -209,23 +249,23 @@ Brain Memory: {json.dumps(brain)}
             "next_action",
             "micro_q",
             "ui_hint",
-            "memory_update",
+            "memory_update"
         }
 
         if not required_keys.issubset(parsed.keys()):
-            raise HTTPException(status_code=500, detail="Model missing required keys")
+            raise ValueError("Missing required keys in AI response")
 
-        # Persist memory
         memory_update = parsed.get("memory_update") or {}
+        memory_update = apply_score_clamp(brain, memory_update)
+
+        parsed["memory_update"] = memory_update
+
         if supabase:
             new_brain = merge_brain(brain, memory_update)
             save_brain(student_id, new_brain)
 
         return parsed
 
-    except HTTPException:
-        raise
-
     except Exception as e:
-        logger.exception("Unhandled error in /respond")
+        # REAL ERROR — NO SILENT MASKING
         raise HTTPException(status_code=500, detail=str(e))

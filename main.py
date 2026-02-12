@@ -2,9 +2,9 @@ import os
 import json
 from typing import Optional, Dict, Any
 
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Response
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 from openai import OpenAI
 from supabase import create_client, Client
 
@@ -22,26 +22,27 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+# Optional: avoid Render probe noise (HEAD / -> 200)
+@app.head("/")
+def head_root():
+    return Response(status_code=200)
+
 # ============================================================
 # CLIENTS
 # ============================================================
 
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
-
 SUPABASE_URL = os.getenv("SUPABASE_URL")
 SUPABASE_KEY = os.getenv("SUPABASE_SERVICE_ROLE_KEY")
 
 if not OPENAI_API_KEY:
     raise RuntimeError("Missing OPENAI_API_KEY env var")
 
-if not SUPABASE_URL or not SUPABASE_KEY:
-    # Keep app running even if Supabase missing; endpoints will error when used.
-    supabase = None
-else:
-    supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
+supabase: Optional[Client] = None
+if SUPABASE_URL and SUPABASE_KEY:
+    supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
 
 client = OpenAI(api_key=OPENAI_API_KEY)
-
 
 # ============================================================
 # REQUEST MODEL
@@ -52,9 +53,8 @@ class BrainRequest(BaseModel):
     chapter: Optional[str] = ""
     concept: Optional[str] = ""
     student_input: str
-    signals: Optional[Dict[str, Any]] = {}
-    brain: Optional[Dict[str, Any]] = {}
-
+    signals: Dict[str, Any] = Field(default_factory=dict)
+    brain: Dict[str, Any] = Field(default_factory=dict)
 
 # ============================================================
 # SYSTEM MASTER PROMPT
@@ -118,13 +118,9 @@ Always update memory_update safely.
 Confidence and stress change max ±10 per turn.
 """
 
-
 # ============================================================
 # HELPERS (SUPABASE)
 # ============================================================
-
-from typing import Dict, Any
-from fastapi import HTTPException
 
 def _require_supabase():
     if supabase is None:
@@ -134,7 +130,13 @@ META_KEYS = {"id", "student_id", "updated_at"}
 
 def load_brain(student_id: str) -> Dict[str, Any]:
     _require_supabase()
-    res = supabase.table("student_brain").select("*").eq("student_id", student_id).limit(1).execute()
+    res = (
+        supabase.table("student_brain")
+        .select("*")
+        .eq("student_id", student_id)
+        .limit(1)
+        .execute()
+    )
     if res.data and len(res.data) > 0:
         row = res.data[0] or {}
         # return only "brain" fields (exclude metadata)
@@ -157,8 +159,6 @@ def merge_brain(existing: Dict[str, Any], memory_update: Dict[str, Any]) -> Dict
     merged.update(memory_update)
     return merged
 
-
-
 # ============================================================
 # ROOT & HEALTH
 # ============================================================
@@ -171,11 +171,9 @@ def root():
         "message": "API is running. Use /docs or POST /respond"
     }
 
-
 @app.get("/health")
 def health():
     return {"ok": True}
-
 
 # ============================================================
 # BRAIN STORAGE ENDPOINTS
@@ -186,12 +184,10 @@ def get_student_brain(student_id: str):
     brain = load_brain(student_id)
     return {"student_id": student_id, "brain": brain}
 
-
 @app.post("/student/{student_id}/brain")
 def set_student_brain(student_id: str, brain: Dict[str, Any]):
     save_brain(student_id, brain)
     return {"ok": True, "student_id": student_id}
-
 
 # ============================================================
 # MAIN AI ENDPOINT
@@ -247,20 +243,13 @@ Brain Memory (student profile): {json.dumps(brain, ensure_ascii=False)}
             new_brain = merge_brain(brain, memory_update)
             save_brain(student_id, new_brain)
 
-        # Optional: return updated brain too (commented to keep schema strict)
-        # parsed["brain"] = new_brain
-
         return parsed
 
-    except Exception:
-        return {
-            "text": "I'm ready to help. Let’s take this step by step.",
-            "mode": "support",
-            "next_action": "retry",
-            "micro_q": "Can you tell me what part feels unclear?",
-            "ui_hint": "calm",
-            "memory_update": {
-                "confidence_score": 50,
-                "stress_score": 40
-            }
-        }
+    except Exception as e:
+        raise HTTPException(
+            status_code=500,
+            detail={
+                "error": str(e),
+                "type": e.__class__.__name__,
+            },
+        )

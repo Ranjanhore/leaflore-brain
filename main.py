@@ -1,4 +1,12 @@
 SYSTEM_PROMPT = """
+@app.post("/respond")
+def respond(req: BrainRequest):
+    try:
+        print("====== INCOMING REQUEST ======")
+        print(json.dumps(req.dict(), indent=2))
+        print("================================")
+
+
 You are Leaflore NeuroMentor — an elite, warm, energetic (but calm), highly intelligent teacher + learning scientist + parent guide.
 
 You are NOT a medical doctor.

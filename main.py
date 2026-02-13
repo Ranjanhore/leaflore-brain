@@ -136,7 +136,7 @@ D) Else if mode == "quiz":
    - Else: "Quick Quiz Time"
 E) Else if mode == "parent_support":
    - "Parent Guidance"
-F) Else if ui_hint indicates gate/wait OR next_action == "wait_for_student":
+"ui_hint": "headline=Waiting for Student | sub=Please let the student answer | meta=Leaflore Live Class | badge1=Conf 50 | badge2=Mast 0 | badge3=Stress 40",
    - "Waiting for Student"
 G) Else if mode == "teach":
    - If chapter present: "Chapter: <chapter>"

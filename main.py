@@ -5,7 +5,7 @@ import logging
 from datetime import datetime, timezone
 from typing import Optional, Dict, Any, Tuple, List
 
-from fastapi import FastAPI, HTTPException, Request
+from fastapi import FastAPI, HTTPException, Request, Header
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 
@@ -21,6 +21,17 @@ logging.basicConfig(level=LOG_LEVEL, format="%(asctime)s %(levelname)s %(message
 logger = logging.getLogger("leaflore-brain")
 
 # ============================================================
+# SECURITY (proxy secret + optional x-api-key)
+# ============================================================
+
+PROXY_SECRET = os.getenv("PROXY_SECRET")  # required header: X-Leaflore-Proxy
+BRAIN_API_KEY = os.getenv("BRAIN_API_KEY")  # if set -> require x-api-key header (except / and /health)
+
+def verify_proxy(x_leaflore_proxy: str = Header(None)):
+    if PROXY_SECRET and x_leaflore_proxy != PROXY_SECRET:
+        raise HTTPException(status_code=403, detail="Forbidden")
+
+# ============================================================
 # APP (MUST BE TOP-LEVEL FOR Render: uvicorn main:app)
 # ============================================================
 
@@ -34,35 +45,6 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# ================================
-# DEBUG: Supabase Environment Check
-# ================================
-
-@app.get("/debug/supabase")
-def debug_supabase():
-    return {
-        "SUPABASE_URL": os.getenv("SUPABASE_URL"),
-        "SERVICE_ROLE_KEY_LENGTH": len(os.getenv("SUPABASE_SERVICE_ROLE_KEY", "")),
-    }
-
-
-@app.get("/debug/columns")
-def debug_columns():
-    from supabase import create_client
-
-    url = os.getenv("SUPABASE_URL")
-    key = os.getenv("SUPABASE_SERVICE_ROLE_KEY")
-
-    sb = create_client(url, key)
-
-    res = sb.table("student_brain").select("mastery_rollup").limit(1).execute()
-
-    return {
-        "data": res.data,
-        "error": str(res.error) if res.error else None
-    }
-
-
 # ============================================================
 # ENV + CLIENTS
 # ============================================================
@@ -70,9 +52,6 @@ def debug_columns():
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 SUPABASE_URL = os.getenv("SUPABASE_URL")
 SUPABASE_KEY = os.getenv("SUPABASE_SERVICE_ROLE_KEY")
-
-# Optional API protection (recommended when called from Lovable edge proxy)
-BRAIN_API_KEY = os.getenv("BRAIN_API_KEY")  # if set -> require x-api-key header
 
 if not OPENAI_API_KEY:
     raise RuntimeError("Missing OPENAI_API_KEY env var")
@@ -86,7 +65,7 @@ else:
     logger.warning("Supabase not configured. Set SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY to enable DB features.")
 
 # ============================================================
-# SECURITY: x-api-key (if BRAIN_API_KEY is configured)
+# MIDDLEWARE: x-api-key (optional)
 # ============================================================
 
 @app.middleware("http")
@@ -94,13 +73,13 @@ async def require_api_key(request: Request, call_next):
     if not BRAIN_API_KEY:
         return await call_next(request)
 
-    # allow health/root without key for uptime checks (optional)
     if request.url.path in ["/", "/health"]:
         return await call_next(request)
 
     key = request.headers.get("x-api-key")
     if not key or key != BRAIN_API_KEY:
         raise HTTPException(status_code=403, detail="Forbidden: invalid or missing x-api-key")
+
     return await call_next(request)
 
 # ============================================================
@@ -110,23 +89,17 @@ async def require_api_key(request: Request, call_next):
 class BrainRequest(BaseModel):
     student_id: Optional[str] = "demo"
 
-    # Curriculum routing
     board: Optional[str] = "ICSE"
     grade: Optional[int] = 6
     subject: Optional[str] = "Science"
     chapter: Optional[str] = ""
     concept: Optional[str] = ""
-    language: Optional[str] = "en"  # request language (en/hi/hinglish or variants)
+    language: Optional[str] = "en"
 
-    # Conversation input
     student_input: str = Field(..., min_length=1)
 
-    # Signals: actor/emotion/engagement/event/student_name/preferred_language/...
     signals: Optional[Dict[str, Any]] = {}
-
-    # Optional brain override
     brain: Optional[Dict[str, Any]] = {}
-
 
 class QuizStartRequest(BaseModel):
     board: str = "ICSE"
@@ -138,7 +111,6 @@ class QuizStartRequest(BaseModel):
     student_ids: List[str] = []
     representative_student_id: Optional[str] = None
     student_level: Optional[int] = None  # 1..5 optional override
-
 
 class QuizAnswerRequest(BaseModel):
     session_id: str
@@ -258,7 +230,7 @@ SYSTEM_PROMPT = os.getenv("SYSTEM_PROMPT", DEFAULT_SYSTEM_PROMPT).strip()
 def utc_now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
 
-def clamp_int(value: Any, lo: int, hi: int, default: int) -> int:
+def clamp_int(value: Any, lo: int, hi: int, default: int = 0) -> int:
     try:
         v = int(value)
     except Exception:
@@ -344,12 +316,15 @@ def load_brain(student_id: str) -> Dict[str, Any]:
     )
     if res.data and len(res.data) > 0:
         row = res.data[0] or {}
+        # If you store brain in brain_state, prefer it:
+        if isinstance(row.get("brain_state"), dict):
+            return row["brain_state"]
+        # fallback:
         return {k: v for k, v in row.items() if k not in META_KEYS and v is not None}
     return {}
 
 def save_brain(student_id: str, brain_data: Dict[str, Any]) -> None:
     _require_supabase()
-
     if not isinstance(brain_data, dict):
         brain_data = {}
 
@@ -358,14 +333,15 @@ def save_brain(student_id: str, brain_data: Dict[str, Any]) -> None:
         "brain_state": brain_data,
     }
 
-    res = supabase.table("student_brain") \
-        .upsert(payload, on_conflict="student_id") \
+    res = (
+        supabase.table("student_brain")
+        .upsert(payload, on_conflict="student_id")
         .execute()
+    )
 
-    if res.error:
+    if getattr(res, "error", None):
         logger.error("Supabase upsert error: %s", res.error)
         raise RuntimeError(str(res.error))
-
 
 def deep_merge(a: Dict[str, Any], b: Dict[str, Any]) -> Dict[str, Any]:
     if not isinstance(a, dict):
@@ -688,7 +664,7 @@ def compute_mastery_rollups(brain: Dict[str, Any], subject: str, chapter: str) -
 # ============================================================
 
 def pick_quiz_difficulty(student_level: int, brain: Dict[str, Any]) -> int:
-    lvl = clamp_int(student_level or 2, 1, 5)
+    lvl = clamp_int(student_level or 2, 1, 5, 2)
 
     mastery_map = brain.get("mastery") or {}
     avg_mastery = None
@@ -731,16 +707,35 @@ def health():
     return {"ok": True, "status": "ok", "time": utc_now_iso()}
 
 # ============================================================
+# DEBUG (optional)
+# ============================================================
+
+@app.get("/debug/supabase")
+def debug_supabase():
+    return {
+        "SUPABASE_URL": os.getenv("SUPABASE_URL"),
+        "SERVICE_ROLE_KEY_LENGTH": len(os.getenv("SUPABASE_SERVICE_ROLE_KEY", "")),
+    }
+
+@app.get("/debug/columns")
+def debug_columns():
+    _require_supabase()
+    res = supabase.table("student_brain").select("brain_state").limit(1).execute()
+    return {"data": res.data, "error": str(getattr(res, "error", None)) if getattr(res, "error", None) else None}
+
+# ============================================================
 # BRAIN STORAGE ENDPOINTS
 # ============================================================
 
 @app.get("/student/{student_id}/brain")
-def get_student_brain(student_id: str):
+def get_student_brain(student_id: str, x_leaflore_proxy: str = Header(None)):
+    verify_proxy(x_leaflore_proxy)
     b = load_brain(student_id)
     return {"student_id": student_id, "brain": b}
 
 @app.post("/student/{student_id}/brain")
-def set_student_brain(student_id: str, brain: Dict[str, Any]):
+def set_student_brain(student_id: str, brain: Dict[str, Any], x_leaflore_proxy: str = Header(None)):
+    verify_proxy(x_leaflore_proxy)
     save_brain(student_id, brain)
     return {"ok": True, "student_id": student_id}
 
@@ -749,7 +744,8 @@ def set_student_brain(student_id: str, brain: Dict[str, Any]):
 # ============================================================
 
 @app.post("/quiz/start")
-def quiz_start(req: QuizStartRequest):
+def quiz_start(req: QuizStartRequest, x_leaflore_proxy: str = Header(None)):
+    verify_proxy(x_leaflore_proxy)
     try:
         _require_supabase()
         if not req.student_ids:
@@ -822,28 +818,34 @@ def quiz_start(req: QuizStartRequest):
         raise HTTPException(status_code=500, detail=str(e))
 
 @app.get("/quiz/{session_id}")
-def quiz_get(session_id: str):
+def quiz_get(session_id: str, x_leaflore_proxy: str = Header(None)):
+    verify_proxy(x_leaflore_proxy)
     try:
         _require_supabase()
-        try:
-    res = supabase.table("student_brain").upsert(data).execute()
-    logger.info("Supabase response: %s", res)
-except Exception as e:
-    logger.exception("Supabase write failed")
-    raise
+
+        res = (
+            supabase.table("classroom_sessions")
+            .select("*")
+            .eq("session_id", session_id)
+            .limit(1)
+            .execute()
+        )
 
         if not res.data:
             raise HTTPException(status_code=404, detail="session not found")
+
         s = res.data[0] or {}
         q = s.get("current_question") or {}
         if isinstance(q, dict):
             q.pop("answer_key", None)
+
         return {
             "session_id": session_id,
             "difficulty": s.get("difficulty"),
             "scores": s.get("scores") or {},
             "question": q,
         }
+
     except HTTPException:
         raise
     except Exception as e:
@@ -851,15 +853,18 @@ except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
 @app.post("/quiz/answer")
-def quiz_answer(req: QuizAnswerRequest):
+def quiz_answer(req: QuizAnswerRequest, x_leaflore_proxy: str = Header(None)):
+    verify_proxy(x_leaflore_proxy)
     try:
         _require_supabase()
 
-        res = supabase.table("student_brain").upsert(data).execute()
-
-if res.error:
-    logger.error("Supabase error: %s", res.error)
-    raise Exception(f"Supabase error: {res.error}")
+        res = (
+            supabase.table("classroom_sessions")
+            .select("*")
+            .eq("session_id", req.session_id)
+            .limit(1)
+            .execute()
+        )
 
         if not res.data:
             raise HTTPException(status_code=404, detail="session_id not found")
@@ -969,7 +974,8 @@ def _llm_call_strict_json(system_prompt: str, user_context: Dict[str, Any]) -> D
         return json.loads(content2)
 
 @app.post("/respond")
-def respond(req: BrainRequest):
+def respond(req: BrainRequest, x_leaflore_proxy: str = Header(None)):
+    verify_proxy(x_leaflore_proxy)
     try:
         student_id = (req.student_id or "demo").strip()
 

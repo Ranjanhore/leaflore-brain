@@ -836,7 +836,12 @@ def quiz_answer(req: QuizAnswerRequest):
     try:
         _require_supabase()
 
-        res = supabase.table("classroom_sessions").select("*").eq("session_id", req.session_id).limit(1).execute()
+        res = supabase.table("student_brain").upsert(data).execute()
+
+if res.error:
+    logger.error("Supabase error: %s", res.error)
+    raise Exception(f"Supabase error: {res.error}")
+
         if not res.data:
             raise HTTPException(status_code=404, detail="session_id not found")
 

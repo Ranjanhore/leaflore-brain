@@ -812,7 +812,13 @@ def quiz_start(req: QuizStartRequest):
 def quiz_get(session_id: str):
     try:
         _require_supabase()
-        res = supabase.table("classroom_sessions").select("*").eq("session_id", session_id).limit(1).execute()
+        try:
+    res = supabase.table("student_brain").upsert(data).execute()
+    logger.info("Supabase response: %s", res)
+except Exception as e:
+    logger.exception("Supabase write failed")
+    raise
+
         if not res.data:
             raise HTTPException(status_code=404, detail="session not found")
         s = res.data[0] or {}

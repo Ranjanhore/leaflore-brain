@@ -351,8 +351,17 @@ def save_brain(student_id: str, brain_data: Dict[str, Any]) -> None:
     _require_supabase()
     if not isinstance(brain_data, dict):
         brain_data = {}
-    payload = {"student_id": student_id, **brain_data}
-    supabase.table("student_brain").upsert(payload).execute()
+
+    payload = {
+        "student_id": student_id,
+        "brain_state": brain_data,
+    }
+
+    res = supabase.table("student_brain").upsert(payload, on_conflict="student_id").execute()
+    if res.error:
+        logger.error("Supabase upsert error: %s", res.error)
+        raise RuntimeError(str(res.error))
+
 
 def deep_merge(a: Dict[str, Any], b: Dict[str, Any]) -> Dict[str, Any]:
     if not isinstance(a, dict):

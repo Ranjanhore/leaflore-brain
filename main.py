@@ -349,6 +349,7 @@ def load_brain(student_id: str) -> Dict[str, Any]:
 
 def save_brain(student_id: str, brain_data: Dict[str, Any]) -> None:
     _require_supabase()
+
     if not isinstance(brain_data, dict):
         brain_data = {}
 
@@ -357,7 +358,10 @@ def save_brain(student_id: str, brain_data: Dict[str, Any]) -> None:
         "brain_state": brain_data,
     }
 
-    res = supabase.table("student_brain").upsert(payload, on_conflict="student_id").execute()
+    res = supabase.table("student_brain") \
+        .upsert(payload, on_conflict="student_id") \
+        .execute()
+
     if res.error:
         logger.error("Supabase upsert error: %s", res.error)
         raise RuntimeError(str(res.error))

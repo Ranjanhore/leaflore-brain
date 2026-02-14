@@ -34,6 +34,35 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+# ================================
+# DEBUG: Supabase Environment Check
+# ================================
+
+@app.get("/debug/supabase")
+def debug_supabase():
+    return {
+        "SUPABASE_URL": os.getenv("SUPABASE_URL"),
+        "SERVICE_ROLE_KEY_LENGTH": len(os.getenv("SUPABASE_SERVICE_ROLE_KEY", "")),
+    }
+
+
+@app.get("/debug/columns")
+def debug_columns():
+    from supabase import create_client
+
+    url = os.getenv("SUPABASE_URL")
+    key = os.getenv("SUPABASE_SERVICE_ROLE_KEY")
+
+    sb = create_client(url, key)
+
+    res = sb.table("student_brain").select("mastery_rollup").limit(1).execute()
+
+    return {
+        "data": res.data,
+        "error": str(res.error) if res.error else None
+    }
+
+
 # ============================================================
 # ENV + CLIENTS
 # ============================================================

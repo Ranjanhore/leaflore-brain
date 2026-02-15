@@ -1,96 +1,47 @@
 from __future__ import annotations
 
-import os
-import re
-from typing import Any, Dict, Optional
+from typing import Optional, Dict, Any, Literal
 
-from fastapi import FastAPI, HTTPException, Request
+from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 
-
-# ----------------------------
-# App
-# ----------------------------
 app = FastAPI(title="Leaflore Brain API", version="1.0.0")
 
-
-# ----------------------------
-# CORS (Lovable + local dev + safe defaults)
-# Notes:
-# - If you set allow_origins=["*"], you MUST keep allow_credentials=False.
-# - This setup fixes the "Origin not allowed" / 403 / preflight issues.
-# ----------------------------
-ALLOW_ORIGIN_REGEX = os.getenv(
-    "ALLOW_ORIGIN_REGEX",
-    r"^https://.*\.lovable(app|project)\.com$|^https://.*\.lovable\.app$|^http://localhost(:\d+)?$",
-)
-
-# Easiest option (works for most apps):
-# allow_origins=["*"] + allow_credentials=False
-# If you need cookies/auth later, switch to explicit origins + allow_credentials=True.
+# CORS: allow Lovable preview/publish + local dev
+# (Wildcard is simplest; keep allow_credentials False with "*")
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
-    allow_origin_regex=ALLOW_ORIGIN_REGEX,
     allow_credentials=False,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-
 # ----------------------------
 # Models
 # ----------------------------
 class RespondRequest(BaseModel):
-    action: str = Field(default="respond")
-    student_input: str
+    action: Literal["respond"] = "respond"
+    student_input: str = Field(..., min_length=1)
 
-    # Optional context (safe defaults)
+    # optional context fields (safe defaults)
     student_id: Optional[str] = None
     board: Optional[str] = None
     grade: Optional[str] = None
     subject: Optional[str] = None
     chapter: Optional[str] = None
     concept: Optional[str] = None
-    language: Optional[str] = None
+    language: Optional[str] = "english"
     signals: Optional[Dict[str, Any]] = None
 
 
-# ----------------------------
-# Helpers
-# ----------------------------
-def _pick_topic(req: RespondRequest) -> str:
-    return req.subject or req.chapter or req.concept or "general"
-
-
-def _teacher_reply(req: RespondRequest) -> Dict[str, Any]:
-    """
-    Replace this with your real teacher brain (LLM / RAG / rules).
-    Keeping it deterministic + safe for now.
-    """
-    text = req.student_input.strip()
-    topic = _pick_topic(req)
-
-    # Example: simple friendly teacher response
-    reply_text = (
-        f"Hi! I heard you say: '{text}'.\n\n"
-        f"Let’s learn about **{topic}** together. "
-        f"Tell me: what do you already know about it, or ask one specific question?"
-    )
-
-    return {
-        "text": reply_text,
-        "emotion": "encouraging",
-        "topic": topic,
-        "next_prompt": "Ask me one specific doubt (for example: 'What is chlorophyll?').",
-        "meta": {
-            "student_id": req.student_id,
-            "grade": req.grade,
-            "board": req.board,
-            "language": req.language,
-        },
-    }
+class RespondResponse(BaseModel):
+    text: str
+    mode: str = "teach"
+    next_action: str = "clarify"
+    ui_hint: str = "Ask a question or press Speak"
+    memory_update: Dict[str, Any] = {}
 
 
 # ----------------------------
@@ -106,33 +57,94 @@ def health():
     return {"status": "ok"}
 
 
-# Optional convenience endpoint (some people test /Render)
-@app.get("/Render")
-def render_health():
-    return {"status": "ok"}
+def _neuro_teacher_reply(student_text: str, ctx: RespondRequest) -> str:
+    """
+    Neuro-therapist + balanced teacher style:
+    - humble + reassuring
+    - specific + short
+    - asks ONE gentle follow-up question
+    - validates emotions without being clinical
+    """
+    s = student_text.strip()
+
+    # Light intent detection (simple, reliable, no external AI)
+    lower = s.lower()
+    is_confused = any(w in lower for w in ["confuse", "confused", "don't understand", "cant understand", "can’t understand"])
+    is_anxious = any(w in lower for w in ["scared", "worried", "anxious", "panic", "stress", "stressed", "nervous"])
+    asks_class = any(w in lower for w in ["which class", "what class", "today", "learn today", "we learn"])
+    asks_name = any(w in lower for w in ["your name", "who are you", "teacher name", "what's your name", "whats your name"])
+
+    # Pull context (keep it subtle)
+    grade = (ctx.grade or "").strip()
+    subject = (ctx.subject or "").strip()
+    chapter = (ctx.chapter or "").strip()
+    concept = (ctx.concept or "").strip()
+
+    # Build a calm, warm opener
+    opener = "Hi 🙂 Thanks for sharing that."
+    if is_anxious:
+        opener = "Hi 🙂 You’re safe here. Thanks for telling me."
+
+    # Specific replies
+    if asks_name:
+        return (
+            f"{opener}\n\n"
+            "I’m Anaya — your friendly science teacher, and I’ll also help you learn in a calm, confident way.\n\n"
+            "Before we start, what name should I call you?"
+        )
+
+    if asks_class:
+        topic = chapter or concept or "today’s science topic"
+        grade_part = f"Grade {grade} " if grade else ""
+        subject_part = f"{subject} " if subject else ""
+        return (
+            f"{opener}\n\n"
+            f"Today we’ll do {grade_part}{subject_part}and focus on **{topic}**.\n"
+            "I’ll explain step-by-step, and you can ask anytime.\n\n"
+            "Quick check: what do you already know about it (even 1 small point)?"
+        )
+
+    if is_confused:
+        topic = chapter or concept or "this topic"
+        return (
+            f"{opener}\n\n"
+            f"No problem — getting confused is part of learning. Let’s make **{topic}** easy.\n"
+            "Tell me the *exact line/word* that feels confusing, and I’ll explain it with a simple example."
+        )
+
+    # Default: balanced teaching + gentle neuro-support
+    topic = chapter or concept or "this"
+    extra = ""
+    if is_anxious:
+        extra = "If you feel stuck, take one slow breath — we’ll do it together.\n"
+
+    return (
+        f"{opener}\n\n"
+        f"{extra}"
+        f"Let’s work on **{topic}**.\n"
+        "Answer in one sentence:\n"
+        "What exactly do you want to understand — meaning, steps, or an example?"
+    )
 
 
-@app.post("/respond")
-async def respond(payload: RespondRequest, request: Request):
-    # Basic validation
+@app.post("/respond", response_model=RespondResponse)
+def respond(payload: RespondRequest) -> RespondResponse:
+    # Only supported action for now
     if payload.action != "respond":
-        raise HTTPException(status_code=400, detail="Invalid action. Use action='respond'.")
+        return RespondResponse(
+            text="I can help! Please send action='respond' with your question.",
+            mode="teach",
+            next_action="clarify",
+            ui_hint="Try again",
+            memory_update={},
+        )
 
-    if not payload.student_input or not payload.student_input.strip():
-        raise HTTPException(status_code=400, detail="student_input cannot be empty")
+    reply_text = _neuro_teacher_reply(payload.student_input, payload)
 
-    try:
-        return _teacher_reply(payload)
-    except Exception as e:
-        # Never crash the server with unhandled exceptions
-        raise HTTPException(status_code=500, detail=f"Internal error: {str(e)}")
-
-
-# ----------------------------
-# Local run (Render uses uvicorn main:app ...)
-# ----------------------------
-if __name__ == "__main__":
-    import uvicorn
-
-    port = int(os.getenv("PORT", "8000"))
-    uvicorn.run("main:app", host="0.0.0.0", port=port, reload=True)
+    return RespondResponse(
+        text=reply_text,
+        mode="teach",
+        next_action="clarify",
+        ui_hint="Ask another question or press Speak",
+        memory_update={},
+    )

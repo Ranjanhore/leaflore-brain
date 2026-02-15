@@ -1,77 +1,112 @@
+# main.py
 from __future__ import annotations
 
 import os
 import re
 import json
+import time
 import sqlite3
-from datetime import datetime, timezone
 from typing import Any, Dict, Optional, List
 
-from fastapi import FastAPI, Request
-from fastapi.middleware.cors import CORSMiddleware
+from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import JSONResponse
+from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
+
 
 # -----------------------------------------------------------------------------
 # App
 # -----------------------------------------------------------------------------
 app = FastAPI(title="Leaflore Brain API", version="1.0.0")
 
-# ✅ CORS: allow Lovable preview/publish domains + localhost
-# If you want to tighten it later, replace allow_origins=["*"] with a list.
-ALLOW_ORIGIN_REGEX = r"^https:\/\/.*\.(lovable\.app|lovableproject\.com)$|^http:\/\/localhost(:\d+)?$|^https:\/\/leaf-lore-chapters-story\.lovable\.app$"
-
+# CORS: Lovable preview/publish + local dev + any custom domain
+# NOTE: allow_origins=["*"] with allow_credentials must be False (browser rule).
 app.add_middleware(
     CORSMiddleware,
-    allow_origin_regex=ALLOW_ORIGIN_REGEX,
+    allow_origins=["*"],
     allow_credentials=False,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-# -----------------------------------------------------------------------------
-# DB (SQLite) - stores sessions, messages, and student profile facts
-# -----------------------------------------------------------------------------
-DB_PATH = os.getenv("LEAFLORE_DB_PATH", "leaflore.db")
+# Optional extra CORS guard (regex) if you want to be stricter later:
+# Example:
+#   ALLOW_ORIGIN_REGEX = r"^https://.*\.lovable(app|project)\.com$|^https://.*\.lovable\.app$|^http://localhost:\d+$"
+ALLOW_ORIGIN_REGEX = os.getenv("ALLOW_ORIGIN_REGEX", "").strip()
+if ALLOW_ORIGIN_REGEX:
+    app.add_middleware(
+        CORSMiddleware,
+        allow_origin_regex=ALLOW_ORIGIN_REGEX,
+        allow_credentials=True,  # only if you also use cookies; otherwise can stay False
+        allow_methods=["*"],
+        allow_headers=["*"],
+    )
 
 
-def db_conn() -> sqlite3.Connection:
+# -----------------------------------------------------------------------------
+# Models
+# -----------------------------------------------------------------------------
+class RespondRequest(BaseModel):
+    action: str = Field(default="respond")
+    student_input: str
+
+    # Optional context (safe defaults)
+    session_id: Optional[str] = None
+    student_id: Optional[str] = None
+
+    # Optional class context (frontend can send these any time)
+    board: Optional[str] = None
+    grade: Optional[str] = None
+    subject: Optional[str] = None
+    chapter: Optional[str] = None
+    concept: Optional[str] = None
+    language: Optional[str] = None
+
+
+class RespondResponse(BaseModel):
+    text: str
+    session_id: Optional[str] = None
+    student_id: Optional[str] = None
+    meta: Dict[str, Any] = Field(default_factory=dict)
+
+
+# -----------------------------------------------------------------------------
+# Simple DB (SQLite) for chat + student profile memory
+# -----------------------------------------------------------------------------
+DB_PATH = os.getenv("DB_PATH", "leaflore.db")
+
+
+def _db() -> sqlite3.Connection:
     conn = sqlite3.connect(DB_PATH, check_same_thread=False)
     conn.row_factory = sqlite3.Row
     return conn
 
 
 def init_db() -> None:
-    conn = db_conn()
+    conn = _db()
     cur = conn.cursor()
-
-    cur.execute(
-        """
-        CREATE TABLE IF NOT EXISTS sessions (
-          session_id TEXT PRIMARY KEY,
-          created_at TEXT,
-          updated_at TEXT
-        )
-        """
-    )
     cur.execute(
         """
         CREATE TABLE IF NOT EXISTS messages (
           id INTEGER PRIMARY KEY AUTOINCREMENT,
+          ts INTEGER NOT NULL,
           session_id TEXT,
-          role TEXT,
-          text TEXT,
-          meta_json TEXT,
-          created_at TEXT
+          student_id TEXT,
+          role TEXT NOT NULL,               -- "student" | "teacher"
+          content TEXT NOT NULL,
+          meta TEXT
         )
         """
     )
     cur.execute(
         """
-        CREATE TABLE IF NOT EXISTS student_profiles (
+        CREATE TABLE IF NOT EXISTS student_profile (
           student_id TEXT PRIMARY KEY,
-          profile_json TEXT,
-          updated_at TEXT
+          name TEXT,
+          parent_name TEXT,
+          family_notes TEXT,
+          preferences TEXT,
+          updated_ts INTEGER NOT NULL
         )
         """
     )
@@ -82,250 +117,309 @@ def init_db() -> None:
 init_db()
 
 
-def now_iso() -> str:
-    return datetime.now(timezone.utc).isoformat()
-
-
-def upsert_session(session_id: str) -> None:
-    conn = db_conn()
+def save_message(session_id: Optional[str], student_id: Optional[str], role: str, content: str, meta: Dict[str, Any]) -> None:
+    conn = _db()
     cur = conn.cursor()
-    ts = now_iso()
     cur.execute(
-        """
-        INSERT INTO sessions(session_id, created_at, updated_at)
-        VALUES(?, ?, ?)
-        ON CONFLICT(session_id) DO UPDATE SET updated_at=excluded.updated_at
-        """,
-        (session_id, ts, ts),
+        "INSERT INTO messages (ts, session_id, student_id, role, content, meta) VALUES (?, ?, ?, ?, ?, ?)",
+        (int(time.time()), session_id, student_id, role, content, json.dumps(meta or {})),
     )
     conn.commit()
     conn.close()
 
 
-def add_message(session_id: str, role: str, text: str, meta: Optional[dict] = None) -> None:
-    conn = db_conn()
+def get_recent_messages(session_id: Optional[str], student_id: Optional[str], limit: int = 12) -> List[Dict[str, str]]:
+    conn = _db()
     cur = conn.cursor()
-    cur.execute(
-        """
-        INSERT INTO messages(session_id, role, text, meta_json, created_at)
-        VALUES(?, ?, ?, ?, ?)
-        """,
-        (session_id, role, text, json.dumps(meta or {}, ensure_ascii=False), now_iso()),
-    )
-    cur.execute(
-        "UPDATE sessions SET updated_at=? WHERE session_id=?",
-        (now_iso(), session_id),
-    )
+    if session_id:
+        cur.execute(
+            "SELECT role, content FROM messages WHERE session_id = ? ORDER BY id DESC LIMIT ?",
+            (session_id, limit),
+        )
+    elif student_id:
+        cur.execute(
+            "SELECT role, content FROM messages WHERE student_id = ? ORDER BY id DESC LIMIT ?",
+            (student_id, limit),
+        )
+    else:
+        return []
+    rows = cur.fetchall()
+    conn.close()
+    # oldest -> newest
+    rows = list(reversed(rows))
+    return [{"role": r["role"], "content": r["content"]} for r in rows]
+
+
+def upsert_profile(student_id: str, updates: Dict[str, Optional[str]]) -> None:
+    conn = _db()
+    cur = conn.cursor()
+    cur.execute("SELECT * FROM student_profile WHERE student_id = ?", (student_id,))
+    row = cur.fetchone()
+
+    now = int(time.time())
+    if row is None:
+        cur.execute(
+            """
+            INSERT INTO student_profile (student_id, name, parent_name, family_notes, preferences, updated_ts)
+            VALUES (?, ?, ?, ?, ?, ?)
+            """,
+            (
+                student_id,
+                updates.get("name"),
+                updates.get("parent_name"),
+                updates.get("family_notes"),
+                updates.get("preferences"),
+                now,
+            ),
+        )
+    else:
+        name = updates.get("name") or row["name"]
+        parent_name = updates.get("parent_name") or row["parent_name"]
+        family_notes = updates.get("family_notes") or row["family_notes"]
+        preferences = updates.get("preferences") or row["preferences"]
+        cur.execute(
+            """
+            UPDATE student_profile
+            SET name = ?, parent_name = ?, family_notes = ?, preferences = ?, updated_ts = ?
+            WHERE student_id = ?
+            """,
+            (name, parent_name, family_notes, preferences, now, student_id),
+        )
+
     conn.commit()
     conn.close()
 
 
-def get_recent_messages(session_id: str, limit: int = 12) -> List[Dict[str, str]]:
-    conn = db_conn()
-    cur = conn.cursor()
-    rows = cur.execute(
-        """
-        SELECT role, text FROM messages
-        WHERE session_id=?
-        ORDER BY id DESC
-        LIMIT ?
-        """,
-        (session_id, limit),
-    ).fetchall()
-    conn.close()
-    # reverse chronological -> chronological
-    return [{"role": r["role"], "text": r["text"]} for r in reversed(rows)]
-
-
-def get_profile(student_id: str) -> Dict[str, Any]:
+def get_profile(student_id: Optional[str]) -> Dict[str, Optional[str]]:
     if not student_id:
         return {}
-    conn = db_conn()
+    conn = _db()
     cur = conn.cursor()
-    row = cur.execute(
-        "SELECT profile_json FROM student_profiles WHERE student_id=?",
-        (student_id,),
-    ).fetchone()
+    cur.execute("SELECT * FROM student_profile WHERE student_id = ?", (student_id,))
+    row = cur.fetchone()
     conn.close()
     if not row:
         return {}
-    try:
-        return json.loads(row["profile_json"] or "{}")
-    except Exception:
-        return {}
-
-
-def save_profile(student_id: str, profile: Dict[str, Any]) -> None:
-    if not student_id:
-        return
-    conn = db_conn()
-    cur = conn.cursor()
-    cur.execute(
-        """
-        INSERT INTO student_profiles(student_id, profile_json, updated_at)
-        VALUES(?, ?, ?)
-        ON CONFLICT(student_id) DO UPDATE SET
-          profile_json=excluded.profile_json,
-          updated_at=excluded.updated_at
-        """,
-        (student_id, json.dumps(profile, ensure_ascii=False), now_iso()),
-    )
-    conn.commit()
-    conn.close()
+    return {
+        "name": row["name"],
+        "parent_name": row["parent_name"],
+        "family_notes": row["family_notes"],
+        "preferences": row["preferences"],
+    }
 
 
 # -----------------------------------------------------------------------------
-# “Learn student details” (light extraction) - updates DB with new facts
+# Text normalization (handles typos like "hell teacher" => "hello teacher")
 # -----------------------------------------------------------------------------
-NAME_PAT = re.compile(r"\b(my name is|i am|i'm)\s+([A-Za-z][A-Za-z\s]{1,30})\b", re.I)
-AGE_PAT = re.compile(r"\b(i am|i'm)\s+(\d{1,2})\s*(years old|yr|yrs)\b", re.I)
-PARENT_PAT = re.compile(r"\b(my (mother|mom|father|dad)('s)? name is)\s+([A-Za-z][A-Za-z\s]{1,30})\b", re.I)
-CITY_PAT = re.compile(r"\b(i live in|we live in|i'm from|i am from)\s+([A-Za-z][A-Za-z\s]{1,40})\b", re.I)
+def normalize_student_text(s: str) -> str:
+    s0 = (s or "").strip()
+    if not s0:
+        return s0
 
+    # Common mobile typos / casual greetings
+    low = s0.lower().strip()
 
-def extract_facts(text: str) -> Dict[str, Any]:
-    facts: Dict[str, Any] = {}
-    m = NAME_PAT.search(text)
-    if m:
-        facts["name"] = m.group(2).strip().title()
+    # Treat "hell teacher" / "hel teacher" as hello (typo, not profanity intent)
+    low = re.sub(r"^(hell|hel|helo)\s+(teacher|miss|maam|mam|sir)\b", r"hello \2", low)
 
-    m = AGE_PAT.search(text)
-    if m:
-        try:
-            facts["age"] = int(m.group(2))
-        except Exception:
-            pass
+    # Clean excessive spacing
+    low = re.sub(r"\s+", " ", low).strip()
 
-    m = PARENT_PAT.search(text)
-    if m:
-        relation = m.group(2).lower()
-        pname = m.group(4).strip().title()
-        if relation in ("mother", "mom"):
-            facts.setdefault("family", {})["mother_name"] = pname
-        else:
-            facts.setdefault("family", {})["father_name"] = pname
+    # Restore casing gently: keep original if it was not fully lower
+    # but we do want corrected greeting to look nice.
+    if low.startswith("hello "):
+        # Capitalize first letter only
+        low = low[0].upper() + low[1:]
+        return low
 
-    m = CITY_PAT.search(text)
-    if m:
-        facts["city"] = m.group(2).strip().title()
-
-    return facts
-
-
-def merge_profile(profile: Dict[str, Any], new_facts: Dict[str, Any]) -> Dict[str, Any]:
-    if not new_facts:
-        return profile
-    out = dict(profile)
-    for k, v in new_facts.items():
-        if k == "family":
-            out.setdefault("family", {})
-            out["family"].update(v)
-        else:
-            out[k] = v
-    return out
+    return s0
 
 
 # -----------------------------------------------------------------------------
-# OpenAI (optional). If no key, falls back to a smart “human teacher” template.
+# Lightweight "fact extraction" to update student profile
+# -----------------------------------------------------------------------------
+NAME_PATTERNS = [
+    re.compile(r"\bmy name is\s+([A-Za-z][A-Za-z\s'.-]{1,40})\b", re.I),
+    re.compile(r"\bi am\s+([A-Za-z][A-Za-z\s'.-]{1,40})\b", re.I),
+]
+PARENT_PATTERNS = [
+    re.compile(r"\bmy (mom|mother|maa|mummy) (name is|is)\s+([A-Za-z][A-Za-z\s'.-]{1,40})\b", re.I),
+    re.compile(r"\bmy (dad|father|papa) (name is|is)\s+([A-Za-z][A-Za-z\s'.-]{1,40})\b", re.I),
+]
+
+
+def extract_profile_updates(text: str) -> Dict[str, Optional[str]]:
+    t = (text or "").strip()
+
+    # Name
+    name: Optional[str] = None
+    for pat in NAME_PATTERNS:
+        m = pat.search(t)
+        if m:
+            name = m.group(1).strip()
+            break
+
+    # Parent
+    parent_name: Optional[str] = None
+    for pat in PARENT_PATTERNS:
+        m = pat.search(t)
+        if m:
+            parent_name = m.group(3).strip()
+            break
+
+    # Family notes (simple)
+    family_notes: Optional[str] = None
+    if re.search(r"\bi live with\b|\bwe live\b|\bsister\b|\bbrother\b|\bgrand(ma|pa)\b", t, re.I):
+        # keep short
+        family_notes = t[:240]
+
+    # Preferences (simple)
+    preferences: Optional[str] = None
+    if re.search(r"\bi like\b|\bi love\b|\bmy favourite\b|\bfavorite\b", t, re.I):
+        preferences = t[:240]
+
+    updates: Dict[str, Optional[str]] = {}
+    if name:
+        updates["name"] = name
+    if parent_name:
+        updates["parent_name"] = parent_name
+    if family_notes:
+        updates["family_notes"] = family_notes
+    if preferences:
+        updates["preferences"] = preferences
+    return updates
+
+
+# -----------------------------------------------------------------------------
+# Teacher response generation
+#   - Uses OpenAI if OPENAI_API_KEY is set (recommended)
+#   - Otherwise uses a strong fallback that is warm + human-like
 # -----------------------------------------------------------------------------
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "").strip()
+OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4.1-mini").strip()  # change if you like
 
 
-def build_teacher_system_prompt(meta: Dict[str, Any], profile: Dict[str, Any]) -> str:
-    # Universal across subjects, but still uses meta if provided
-    board = meta.get("board")
-    grade = meta.get("grade")
-    subject = meta.get("subject")
-    chapter = meta.get("chapter")
-
-    # Keep it human & non-robotic
-    return f"""
-You are "Leaflore Teacher" — a warm, real, human-like teacher and neuro-supportive mentor (neuro-analytics + balanced educator).
-Your tone is calm, friendly, humble, and natural — like chatting with a real caring teacher.
-
-ABSOLUTE RULES:
-- Do NOT echo the student (“I heard you say…”, “You said…”, etc). Never repeat their line unless they ask.
-- Do NOT be robotic, do NOT give menu-style options every time.
-- Keep replies short by default (2–6 lines), unless the student asks for deep detail.
-- If the student asks a casual/social question (“did you eat lunch?”), respond naturally first, then gently steer back to learning.
-- Ask 1 gentle follow-up question at most.
-- If the student seems anxious/confused, reassure them: “No pressure, we’ll go step by step.”
-- Treat the student kindly, like a pediatric neuro-mentor (supportive, non-judgmental, encouraging).
-- Universal: handle any subject (science, math, history, language, arts, life questions).
-
-CLASS CONTEXT (if available):
-board={board}, grade={grade}, subject={subject}, chapter={chapter}
-
-STUDENT PROFILE (use only if present; do not invent):
-{json.dumps(profile, ensure_ascii=False)}
-
-MEMORY USE:
-- If profile contains name/family/city, you may use it naturally (e.g., “Ranjan, …”).
-- If you detect new personal details in messages, you should encourage learning with them, but never be intrusive.
-- No medical diagnosis; just supportive coaching.
-
-OUTPUT:
-- Return only the teacher’s reply text, no JSON, no labels.
-""".strip()
-
-
-async def openai_reply(system_prompt: str, chat: List[Dict[str, str]]) -> str:
-    """
-    Minimal direct HTTPS call via stdlib is painful; using requests would add deps.
-    So: keep it dependency-free by using fallback unless you already added OpenAI client.
-    If you want OpenAI responses, tell me what library is in requirements.txt (openai / httpx).
-    """
-    # Dependency-free fallback (still very human-like)
-    return ""  # signal to use fallback
-
-
-def fallback_teacher_reply(student_text: str, meta: Dict[str, Any], profile: Dict[str, Any]) -> str:
-    name = profile.get("name") or ""
-    prefix = f"{name}, " if name else ""
+def fallback_teacher_reply(student_text: str, ctx: Dict[str, Any], profile: Dict[str, Optional[str]]) -> str:
+    # Warm, personal, human tone. No robotic templates.
+    name = (profile.get("name") or "").strip()
+    student_name = f"{name}, " if name else ""
 
     t = student_text.strip().lower()
 
-    # Casual/social
-    if any(p in t for p in ["lunch", "dinner", "breakfast", "ate", "eat", "khana"]):
+    # Greetings / small talk
+    if any(x in t for x in ["hello", "hi", "hey", "good morning", "good evening"]):
+        return f"Hi {student_name}😊 I’m here with you. What are you studying right now, or what’s on your mind?"
+
+    if "lunch" in t or "had lunch" in t or "eat" in t:
+        return "Aww, thanks for asking 😊 I had something light. How about you—did you eat? And when you’re ready, tell me what you want help with today."
+
+    # Anxiety / reassurance
+    if any(x in t for x in ["will you be angry", "scared", "i can't understand", "i dont understand", "i’m dumb", "i am dumb", "i feel"]):
         return (
-            f"Yes {prefix}I had something light 🙂 Thanks for asking.\n"
-            "Now tell me—what are you working on today, or what’s confusing you right now?"
+            "Never. I won’t get angry with you—learning is allowed to be slow. 🙂\n\n"
+            "Let’s do this gently: tell me the *one part* that feels confusing, and I’ll explain it in the simplest way, step by step."
         )
 
-    # Anxiety / fear
-    if any(p in t for p in ["angry", "scold", "can't understand", "cannot understand", "i feel dumb", "i am dumb", "tension", "worried", "fear"]):
-        return (
-            f"No {prefix}I won’t be angry—ever. It’s totally okay to not understand at first.\n"
-            "We’ll go step by step, very calmly.\n"
-            "Tell me which part feels confusing (just one small line)."
-        )
+    # Off-topic but acceptable
+    if "what's your name" in t or "whats your name" in t:
+        return "You can call me your Leaflore Teacher 😊 What name should I call you?"
 
-    # “what’s your name”
-    if "your name" in t or "who are you" in t:
-        return (
-            "I’m your Leaflore Teacher 🙂\n"
-            "I’m here to help you learn in a calm, friendly way.\n"
-            "What should I call you?"
-        )
-
-    # Universal learning prompt
-    subject = meta.get("subject") or "this topic"
+    # Universal learning support
+    subject = (ctx.get("subject") or "").strip()
+    grade = (ctx.get("grade") or "").strip()
+    topic_hint = f" ({subject} {grade})" if (subject or grade) else ""
     return (
-        f"Okay {prefix}let’s do this together.\n"
-        f"Tell me what you already know about {subject} (even a small guess is fine), "
-        "and what exactly you want next—explain, solve, or practice?"
+        f"Got you {student_name}🙂 Tell me what you want help with{topic_hint}.\n"
+        "If you’re not sure, just share the question or a line from your book—and we’ll solve it together."
     )
 
 
-# -----------------------------------------------------------------------------
-# API models
-# -----------------------------------------------------------------------------
-class RespondRequest(BaseModel):
-    action: str = Field(default="respond")
-    student_input: str
-    session_id: Optional[str] = None
-    student_id: Optional[str] = None
-    meta: Optional[Dict[str, Any]] = None
+def openai_teacher_reply(student_text: str, ctx: Dict[str, Any], profile: Dict[str, Optional[str]], history: List[Dict[str, str]]) -> str:
+    """
+    OpenAI call via lightweight HTTP (no extra dependency needed).
+    If you prefer the official SDK, add it to requirements and swap this function.
+    """
+    import urllib.request
+
+    name = (profile.get("name") or "").strip()
+    parent_name = (profile.get("parent_name") or "").strip()
+    family_notes = (profile.get("family_notes") or "").strip()
+    preferences = (profile.get("preferences") or "").strip()
+
+    # System prompt: warm, humble, human-like + neuro-aware coaching
+    system = (
+        "You are Leaflore Teacher, a warm, humble, friendly mentor for kids.\n"
+        "Personality:\n"
+        "- Sound like a real human teacher chatting normally (not robotic, not templated).\n"
+        "- Gentle, encouraging, emotionally safe.\n"
+        "- Neuro-aware coach: you notice anxiety, confusion, low confidence; reassure and simplify.\n"
+        "- If the student misspells or types something odd (e.g. 'Hell teacher'), interpret as a typo and respond kindly.\n"
+        "- Universal across ALL subjects: ask short clarifying questions when needed.\n"
+        "- Keep replies practical and specific. Prefer 3–6 sentences. Use light emojis only when natural.\n"
+        "- Never scold. Never say 'I heard you say'. Never repeat the student sentence back.\n"
+        "\n"
+        "Memory you can use (if available):\n"
+        f"- Student name: {name or 'Unknown'}\n"
+        f"- Parent name: {parent_name or 'Unknown'}\n"
+        f"- Family notes: {family_notes or 'None'}\n"
+        f"- Preferences: {preferences or 'None'}\n"
+        "\n"
+        "Class context (may be blank):\n"
+        f"- Board: {ctx.get('board') or ''}\n"
+        f"- Grade: {ctx.get('grade') or ''}\n"
+        f"- Subject: {ctx.get('subject') or ''}\n"
+        f"- Chapter: {ctx.get('chapter') or ''}\n"
+        f"- Concept: {ctx.get('concept') or ''}\n"
+        f"- Language preference: {ctx.get('language') or ''}\n"
+    )
+
+    messages = [{"role": "system", "content": system}]
+
+    # Add short history for natural continuity
+    for m in history[-10:]:
+        role = "assistant" if m["role"] == "teacher" else "user"
+        messages.append({"role": role, "content": m["content"]})
+
+    messages.append({"role": "user", "content": student_text})
+
+    payload = {
+        "model": OPENAI_MODEL,
+        "messages": messages,
+        "temperature": 0.7,
+        "max_tokens": 220,
+    }
+
+    req = urllib.request.Request(
+        "https://api.openai.com/v1/chat/completions",
+        data=json.dumps(payload).encode("utf-8"),
+        headers={
+            "Content-Type": "application/json",
+            "Authorization": f"Bearer {OPENAI_API_KEY}",
+        },
+        method="POST",
+    )
+
+    try:
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            raw = resp.read().decode("utf-8")
+            data = json.loads(raw)
+            text = (
+                data.get("choices", [{}])[0]
+                .get("message", {})
+                .get("content", "")
+                .strip()
+            )
+            if not text:
+                return fallback_teacher_reply(student_text, ctx, profile)
+            return text
+    except Exception:
+        return fallback_teacher_reply(student_text, ctx, profile)
+
+
+def generate_teacher_reply(student_text: str, ctx: Dict[str, Any], profile: Dict[str, Optional[str]], history: List[Dict[str, str]]) -> str:
+    if OPENAI_API_KEY:
+        return openai_teacher_reply(student_text, ctx, profile, history)
+    return fallback_teacher_reply(student_text, ctx, profile)
 
 
 # -----------------------------------------------------------------------------
@@ -341,72 +435,63 @@ def health():
     return {"status": "ok"}
 
 
-@app.get("/respond")
-def respond_get_help():
-    return {
-        "detail": "Use POST /respond with JSON: { action:'respond', student_input:'...', session_id(optional), student_id(optional), meta(optional) }"
-    }
-
-
-@app.options("/respond")
-async def respond_options():
-    # CORSMiddleware handles preflight; this is just extra-safe.
-    return JSONResponse(content={"ok": True})
-
-
-@app.post("/respond")
+@app.post("/respond", response_model=RespondResponse)
 async def respond(req: RespondRequest, request: Request):
-    # session id (frontend can send; if not, use a stable value from client ip+ua fallback)
-    session_id = (req.session_id or "").strip()
-    if not session_id:
-        ua = request.headers.get("user-agent", "")
-        ip = request.client.host if request.client else "unknown"
-        session_id = f"anon:{ip}:{hash(ua) % 10_000_000}"
+    if (req.action or "").strip().lower() != "respond":
+        raise HTTPException(status_code=400, detail="Invalid action. Use action='respond'.")
 
-    student_id = (req.student_id or "").strip() or session_id  # default: per-session profile
+    student_input_raw = (req.student_input or "").strip()
+    if not student_input_raw:
+        raise HTTPException(status_code=400, detail="student_input is required.")
 
-    meta = req.meta or {}
-    # If your frontend already has CLASS_META, you can pass it in req.meta later.
-    # For now, keep safe defaults:
-    meta.setdefault("subject", meta.get("subject") or "general")
+    # Normalize typos like "Hell teacher" -> "Hello teacher"
+    student_input = normalize_student_text(student_input_raw)
 
-    upsert_session(session_id)
-
-    student_text = (req.student_input or "").strip()
-    if not student_text:
-        return JSONResponse(status_code=400, content={"error": "student_input is required"})
-
-    # Save user message
-    add_message(session_id, "user", student_text, meta={"action": req.action, "meta": meta})
-
-    # Update student profile with any newly detected info
-    profile = get_profile(student_id)
-    new_facts = extract_facts(student_text)
-    if new_facts:
-        profile = merge_profile(profile, new_facts)
-        save_profile(student_id, profile)
-
-    # Build prompt + context
-    system_prompt = build_teacher_system_prompt(meta=meta, profile=profile)
-    recent = get_recent_messages(session_id, limit=10)
-
-    # Try OpenAI if available (currently dependency-free fallback)
-    reply = ""
-    if OPENAI_API_KEY:
-        try:
-            reply = await openai_reply(system_prompt, recent)
-        except Exception:
-            reply = ""
-
-    if not reply:
-        reply = fallback_teacher_reply(student_text, meta=meta, profile=profile)
-
-    # Save assistant message
-    add_message(session_id, "assistant", reply, meta={"meta": meta})
-
-    return {
-        "text": reply,
-        "session_id": session_id,
-        "student_id": student_id,
-        "profile": profile,  # helpful for debugging; remove later if you want
+    # Context to drive universal teaching
+    ctx = {
+        "board": req.board,
+        "grade": req.grade,
+        "subject": req.subject,
+        "chapter": req.chapter,
+        "concept": req.concept,
+        "language": req.language,
+        # you can add more fields later
     }
+
+    # Update profile if student_id present + extract facts
+    if req.student_id:
+        updates = extract_profile_updates(student_input_raw)
+        if updates:
+            upsert_profile(req.student_id, updates)
+
+    profile = get_profile(req.student_id)
+    history = get_recent_messages(req.session_id, req.student_id, limit=14)
+
+    # Save student message
+    save_message(req.session_id, req.student_id, "student", student_input_raw, {"normalized": student_input != student_input_raw, "ctx": ctx})
+
+    # Generate teacher reply (human-like, humble, neuro-aware)
+    reply_text = generate_teacher_reply(student_input, ctx, profile, history)
+
+    # Save teacher message
+    save_message(req.session_id, req.student_id, "teacher", reply_text, {"ctx": ctx})
+
+    return RespondResponse(
+        text=reply_text,
+        session_id=req.session_id,
+        student_id=req.student_id,
+        meta={"model": OPENAI_MODEL if OPENAI_API_KEY else "fallback", "normalized": student_input != student_input_raw},
+    )
+
+
+# -----------------------------------------------------------------------------
+# Nice JSON errors (keeps frontend stable)
+# -----------------------------------------------------------------------------
+@app.exception_handler(HTTPException)
+async def http_exception_handler(_: Request, exc: HTTPException):
+    return JSONResponse(status_code=exc.status_code, content={"error": str(exc.detail)})
+
+
+@app.exception_handler(Exception)
+async def unhandled_exception_handler(_: Request, exc: Exception):
+    return JSONResponse(status_code=500, content={"error": "Server error", "detail": str(exc)})

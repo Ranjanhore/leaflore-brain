@@ -1,28 +1,45 @@
 import os
 from typing import Any, Dict, Optional
 
-from fastapi import FastAPI, Request
+from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse
 
-app = FastAPI(title="Leaflore Brain API", version="1.0.0")
+app = FastAPI()
 
-# ✅ CORS: allow Lovable + local dev.
-# For quick testing you can keep "*" but production is safer with explicit origins.
-ALLOWED_ORIGINS = os.getenv(
-    "CORS_ALLOW_ORIGINS",
-    "https://lovable.dev,https://*.lovable.app,http://localhost:5173,http://localhost:3000",
-)
+# 🔥 IMPORTANT: allow your frontend origin
+origins = [
+    "https://lovable.dev",
+    "http://localhost:5173",  # for local dev if needed
+    "*",  # temporary for testing (can remove later)
+]
 
-# FastAPI CORSMiddleware does not understand wildcard subdomains like https://*.lovable.app directly.
-# So we allow any origin in middleware and enforce a light origin check below.
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # we enforce in-code below
+    allow_origins=origins,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+@app.get("/")
+def root():
+    return {
+        "service": "Leaflore Brain API",
+        "health": "/health",
+        "respond": "/respond",
+    }
+
+@app.get("/health")
+def health():
+    return {"status": "ok"}
+
+@app.post("/respond")
+async def respond(data: dict):
+    student_input = data.get("student_input", "")
+
+    return {
+        "text": f"Teacher says: I received your message: {student_input}"
+    }
 
 def _origin_allowed(origin: Optional[str]) -> bool:
     if not origin:

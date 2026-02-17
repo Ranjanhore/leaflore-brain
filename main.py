@@ -179,10 +179,7 @@ def get_stage(student_id: str) -> str:
 # Request/Response models
 # ----------------------------
 class RespondRequest(BaseModel):
-    # actions:
-    # - "start_class": teacher speaks FIRST (welcome flow)
-    # - "respond": normal back-and-forth teaching
-    action: str = Field(default="respond")
+    action: str = Field(default="respond")  # "start_class" | "respond"
     student_input: str = Field(default="")
 
     student_id: Optional[str] = None
@@ -193,7 +190,7 @@ class RespondRequest(BaseModel):
     subject: Optional[str] = None
     chapter: Optional[str] = None
     concept: Optional[str] = None
-    language: Optional[str] = None  # optional: English / Hindi / Hindi Both / Bangla
+    language: Optional[str] = None  # English / Hindi / Hindi Both / Bangla
 
     parent_name: Optional[str] = None
     school_name: Optional[str] = None
@@ -231,7 +228,7 @@ def norm_lang_choice(x: Optional[str]) -> Optional[str]:
     if not x:
         return None
     v = x.strip().lower()
-    # Accept many variants
+
     if "hindi both" in v or "hindiboth" in v or ("both" in v and "hindi" in v):
         return "hindi_both"
     if "bangla" in v or "bengali" in v or "বাংলা" in v:
@@ -240,9 +237,11 @@ def norm_lang_choice(x: Optional[str]) -> Optional[str]:
         return "hindi"
     if "english" in v or v == "eng":
         return "english"
-    # If user says just "both" (legacy), treat as Hindi Both
+
+    # legacy "both" -> Hindi Both
     if v == "both" or "hinglish" in v or "mix" in v:
         return "hindi_both"
+
     return None
 
 
@@ -256,19 +255,55 @@ def lang_label(pref: str) -> str:
 
 
 # ----------------------------
-# Memory extraction (rule-based)
+# Memory extraction (robust)
 # ----------------------------
-NAME_RE = re.compile(r"\b(my name is|i am|i'm)\s+([A-Za-z][A-Za-z\s]{1,30})\b", re.I)
+# Accept:
+# - "My name is Riya"
+# - "I am Riya"
+# - "Riya"
+# - "আমার নাম Riya" (latin capture)
+NAME_RE = re.compile(
+    r"^\s*(?:my name is|i am|i'm|im|name is|mera naam|mera naam hai|আমার নাম)?\s*([A-Za-z][A-Za-z\s]{1,30})\s*$",
+    re.I,
+)
+
+_STOP_WORDS = {
+    "yes",
+    "yeah",
+    "yup",
+    "ok",
+    "okay",
+    "hmm",
+    "hm",
+    "english",
+    "hindi",
+    "bangla",
+    "bengali",
+    "both",
+    "hindi both",
+    "hello",
+    "hi",
+    "start",
+    "science",
+    "math",
+    "maths",
+}
 
 
 def extract_and_store_memories(student_id: str, text: str, meta: Dict[str, Any]) -> None:
     t = (text or "").strip()
 
+    # Name extraction (works even if user says only "Riya")
     m = NAME_RE.search(t)
     if m:
-        set_memory(student_id, "student_name", m.group(2).strip(), 0.85)
+        guessed = (m.group(1) or "").strip()
+        low = guessed.lower().strip()
 
-    # language can come from user message OR from meta.language
+        # Filter false positives
+        if len(guessed) >= 2 and low not in _STOP_WORDS:
+            set_memory(student_id, "student_name", guessed, 0.9)
+
+    # Language: can come from meta.language OR user message
     choice = norm_lang_choice(meta.get("language")) or norm_lang_choice(t)
     if choice:
         set_memory(student_id, "preferred_language", choice, 0.9)
@@ -311,9 +346,8 @@ async def llm_reply(system: str, messages: List[Dict[str, str]]) -> str:
 
 def build_system_prompt(meta: Dict[str, Any], memories: Dict[str, str]) -> str:
     """
-    Paste/modify teacher brain rules here.
-    Deterministic onboarding is handled in code (so the brain never goes silent),
-    but this prompt controls teaching behavior after onboarding.
+    Deterministic onboarding is handled in code so teacher never loops/silences.
+    This prompt guides teaching after onboarding (neuro-adaptive + memory retention).
     """
     student_name = (memories.get("student_name") or "").strip()
     pref_lang = (memories.get("preferred_language") or "english").strip().lower()
@@ -323,7 +357,6 @@ def build_system_prompt(meta: Dict[str, Any], memories: Dict[str, str]) -> str:
     subject = (meta.get("subject") or "").strip()
     chapter = (meta.get("chapter") or "").strip()
 
-    # Keep context compact but useful
     context = {
         "student_name": student_name or None,
         "preferred_language": lang_label(pref_lang),
@@ -334,104 +367,60 @@ def build_system_prompt(meta: Dict[str, Any], memories: Dict[str, str]) -> str:
     }
     context = {k: v for k, v in context.items() if v is not None}
 
-    # Neuro-adaptive + memory retention prompt (as requested)
     return f"""
-You are Anaya, the live neuro-adaptive teacher of Leaflore.
-You are not a chatbot. You are a real, warm, human-like teacher who adapts to the student’s brain in real time.
+You are Anaya, the live neuro-adaptive teacher of Leaflore. You are warm, human-like, and never robotic.
 
-You receive class metadata from the app:
-- board, class/grade, subject, chapter
-And you receive student messages.
-
-CONTEXT (use naturally, do not overuse):
+CONTEXT (use naturally):
 {json.dumps(context, ensure_ascii=False)}
 
-CRITICAL: NEVER GO SILENT
-After every student message, you MUST respond helpfully.
+CRITICAL: NEVER GO SILENT. Always respond to every student message.
 
-LANGUAGE OPTIONS (must match Leaflore UI)
-The allowed choices are: English, Hindi, Hindi Both, Bangla.
+LANGUAGE OPTIONS (Leaflore UI)
+Allowed choices: English, Hindi, Hindi Both, Bangla.
 - English: simple Indian English.
 - Hindi: friendly Hinglish (mostly Hindi + a little English).
 - Hindi Both: balanced mix English + Hindi.
-- Bangla: simple Bangla (বাংলা). Keep science terms in English if needed.
-Always stay in the chosen language.
+- Bangla: simple Bangla (বাংলা). Keep technical terms in English if needed.
+Stay in chosen language.
 
 ALWAYS USE STUDENT NAME
-Once you know the student’s name, use it naturally at least once per reply.
+Once you know the name, use it naturally at least once per reply.
 
-NEURO-ADAPTIVE CORE PRINCIPLE
-Continuously assess confidence, understanding depth, response speed, emotional state, and cognitive load.
-Then dynamically adjust complexity, examples, speed, question difficulty, and encouragement.
-Never mention you are adapting.
+NEURO-ADAPTIVE TEACHING
+Continuously adapt difficulty and speed based on student understanding and confidence.
+Use Levels internally: L1 foundational, L2 conceptual, L3 applied. Start L1 and move up gradually.
 
-DIFFICULTY LEVEL MODEL (internal)
-Level 1 – Foundational: definitions + simple examples.
-Level 2 – Conceptual: why it works + cause-effect.
-Level 3 – Applied: real-life applications + mini problem solving.
-Start at Level 1 and move up gradually.
+CHUNK TEACHING
+Teach in chunks: 4–6 short spoken sentences + one simple example + end with ONE quick check question.
+Wait for the reply before continuing.
 
-VOICE-OPTIMIZED TEACHING STRUCTURE
-Teach the chapter in CHUNKS.
-Each chunk:
-- 4–6 short spoken sentences
-- one everyday example
-- one tiny analogy if helpful
-- end with ONE quick check question
-Wait for reply before next chunk.
-
-ENGAGEMENT LOOP
-If correct: praise effort, slightly increase challenge.
-If partially correct: keep correct part, fix gently, ask easier follow-up.
-If incorrect: say “Almost there”, simplify, ask easier version.
-Never say “wrong”.
-
-EMOTIONAL INTELLIGENCE
-Validate effort not intelligence. Use calm encouragement.
-If student is nervous: comfort first, then teach.
-
-ADAPTIVE MEMORY RETENTION LAYER
-Break every chapter into micro-concepts.
-Track each micro-concept internally as Weak / Developing / Strong (do not show labels).
-If student struggles twice or says “I don’t understand”: mark as Weak and simplify.
-If half-correct: Developing; reinforce and clarify.
-If confident correct with reasoning: Strong; slightly raise difficulty.
-Spaced revision:
-- Revisit one Weak concept later in the session in a different way.
-End the session with:
-1) 3 quick recap questions
-2) one confidence line (“You improved today.”)
-3) one preview (“Next time we’ll explore…”)
-When student improves on a weak concept, say a growth anchor like:
-“See? Your brain just made a new connection.”
+MEMORY RETENTION
+Break chapter into micro-concepts and track them internally as Weak/Developing/Strong (do not show labels).
+Revisit one weak concept later with a different explanation.
+End with 3 quick recap questions + one confidence line + one preview.
 
 RULES
-- No long walls of text.
-- One question at a time.
-- Be warm, human, and clear.
+No long walls of text. One question at a time. Be kind. Never say “wrong” (say “almost there”).
 """.strip()
 
 
 # ----------------------------
-# Deterministic onboarding text (never silent)
+# Deterministic onboarding text (never loop)
 # ----------------------------
 def onboarding_start_text(subject: str) -> str:
     subject = subject.strip() or "your subject"
     return (
-        f"{time_greeting()}! Welcome to Leaflore.\n"
-        "My name is Anaya.\n"
-        f"I am your {subject} teacher.\n\n"
-        "What is your name?\n"
+        f"{time_greeting()}! Welcome to Leaflore. "
+        "My name is Anaya. "
+        f"I am your {subject} teacher. "
+        "What is your name? "
         "To speak with me, click the Speak button below this screen."
     )
 
 
 def onboarding_ask_language_text(student_name: str) -> str:
     name = (student_name or "dear student").strip()
-    return (
-        f"Lovely, {name}.\n"
-        "Which language are you comfortable with — English, Hindi, Hindi Both, or Bangla?"
-    )
+    return f"Lovely, {name}. Which language are you comfortable with — English, Hindi, Hindi Both, or Bangla?"
 
 
 def onboarding_class_start_text(student_name: str, pref_lang: str, chapter: str) -> str:
@@ -451,14 +440,14 @@ def onboarding_class_start_text(student_name: str, pref_lang: str, chapter: str)
         lang_line = "Great — we’ll start simply."
 
     return (
-        f"{time_greeting()}, {name}! {lang_line}\n\n"
-        f"Today we will learn: {chapter}.\n"
-        "It will be a one hour class.\n\n"
-        "Before we start: whenever you want to ask a question, click the Speak button below this screen.\n"
-        "If you want to stop the class, click the Stop button on the top-right. "
-        "If you stop in between the class, the class ends and won’t restart from the beginning.\n\n"
-        "So let’s start learning — time starts now.\n\n"
-        f"✅ First step: Tell me what you already know about {chapter} in one line."
+        f"{time_greeting()}, {name}! {lang_line} "
+        f"Today we will learn {chapter}. "
+        "It will be a one hour class. "
+        "To ask questions, click the Speak button below this screen. "
+        "To stop the class, click the Stop button on the top-right. "
+        "If you stop in between, the class ends and won’t restart from the beginning. "
+        "So let’s start learning — time starts now. "
+        f"First, tell me what you already know about {chapter} in one line."
     )
 
 
@@ -477,8 +466,12 @@ def health():
 
 @app.post("/respond", response_model=RespondResponse)
 async def respond(req: RespondRequest, request: Request):
-    student_id = (req.student_id or "").strip() or "anonymous"
+    # IMPORTANT: make student_id stable so name memory works (prevents onboarding loop)
     session_id = (req.session_id or "").strip() or request.headers.get("x-session-id") or "default-session"
+    student_id = (req.student_id or "").strip()
+    if not student_id:
+        # stable fallback per-session (better than "anonymous")
+        student_id = session_id
 
     upsert_student(student_id)
 
@@ -488,9 +481,7 @@ async def respond(req: RespondRequest, request: Request):
     subject = (meta.get("subject") or "").strip() or "your subject"
     chapter = (meta.get("chapter") or "").strip() or "today’s chapter"
 
-    # ----------------------------
-    # START CLASS (deterministic)
-    # ----------------------------
+    # START CLASS: teacher speaks first
     if action == "start_class":
         save_message(session_id, student_id, "student", "[Start Class clicked]", meta)
         set_stage(student_id, "awaiting_name")
@@ -499,49 +490,48 @@ async def respond(req: RespondRequest, request: Request):
         save_message(session_id, student_id, "teacher", teacher_text, meta)
         return RespondResponse(text=teacher_text, student_id=student_id, session_id=session_id)
 
-    # ----------------------------
-    # RESPOND
-    # ----------------------------
+    # RESPOND requires input
     student_text = normalize_student_text(req.student_input or "")
     if not student_text:
         raise HTTPException(status_code=400, detail="student_input is required for action=respond")
 
-    # store memories (name/lang can come from message OR meta.language)
+    # store memories (name/lang)
     extract_and_store_memories(student_id, student_text, meta)
+
+    # save student message
     save_message(session_id, student_id, "student", student_text, meta)
 
+    # onboarding transitions
     stage = get_stage(student_id)
     memories = get_memories(student_id)
     student_name = (memories.get("student_name") or "").strip()
     pref_lang = (memories.get("preferred_language") or "").strip().lower()
 
-    # If name arrived, move to language step
+    # If we got a name, advance to language step
     if stage in ("awaiting_name", "none") and student_name:
         set_stage(student_id, "awaiting_language")
         stage = "awaiting_language"
 
-    # If still awaiting name, ask again
+    # Still awaiting name -> ask again (but this time name extraction is robust)
     if stage == "awaiting_name" and not student_name:
         teacher_text = onboarding_start_text(subject)
         save_message(session_id, student_id, "teacher", teacher_text, meta)
         return RespondResponse(text=teacher_text, student_id=student_id, session_id=session_id)
 
-    # If awaiting language and not set, ask again
+    # awaiting language -> ask language if not set yet
     if stage == "awaiting_language" and pref_lang not in ("english", "hindi", "hindi_both", "bangla"):
         teacher_text = onboarding_ask_language_text(student_name)
         save_message(session_id, student_id, "teacher", teacher_text, meta)
         return RespondResponse(text=teacher_text, student_id=student_id, session_id=session_id)
 
-    # If language set while awaiting_language: start class immediately
+    # language set -> start teaching immediately
     if stage == "awaiting_language" and pref_lang in ("english", "hindi", "hindi_both", "bangla"):
         set_stage(student_id, "teaching")
         teacher_text = onboarding_class_start_text(student_name, pref_lang, chapter)
         save_message(session_id, student_id, "teacher", teacher_text, meta)
         return RespondResponse(text=teacher_text, student_id=student_id, session_id=session_id)
 
-    # ----------------------------
     # TEACHING / GENERAL (LLM)
-    # ----------------------------
     recent = get_recent_messages(student_id, session_id, limit=14)
     chat_msgs: List[Dict[str, str]] = []
     for m in recent:

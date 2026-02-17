@@ -6,15 +6,15 @@ import re
 import json
 import time
 import sqlite3
-from typing import Any, Dict, Optional, List
+from typing import Any, Dict, Optional, List, Tuple
 
-from fastapi import FastAPI, Request
+from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 
-# ----------------------------
+# ============================
 # App
-# ----------------------------
+# ============================
 app = FastAPI(title="Leaflore Brain API")
 
 app.add_middleware(
@@ -25,12 +25,21 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# ----------------------------
-# DB (SQLite for demo memory/state)
-# ----------------------------
+# ============================
+# Env
+# ============================
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "").strip()
+OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini").strip()
+
+SUPABASE_URL = os.getenv("SUPABASE_URL", "").strip().rstrip("/")
+SUPABASE_SERVICE_ROLE_KEY = os.getenv("SUPABASE_SERVICE_ROLE_KEY", "").strip()
+
 DB_PATH = os.getenv("DB_PATH", "/tmp/leaflore.db")
 
 
+# ============================
+# DB (SQLite) - session + memory + messages
+# ============================
 def _db() -> sqlite3.Connection:
     conn = sqlite3.connect(DB_PATH, check_same_thread=False)
     conn.row_factory = sqlite3.Row
@@ -41,25 +50,64 @@ def init_db() -> None:
     conn = _db()
     cur = conn.cursor()
 
-    cur.execute("""
-    CREATE TABLE IF NOT EXISTS memories (
-      student_id TEXT,
-      key TEXT,
-      value TEXT,
-      PRIMARY KEY(student_id, key)
+    cur.execute(
+        """
+    CREATE TABLE IF NOT EXISTS students (
+      student_id TEXT PRIMARY KEY,
+      created_at INTEGER NOT NULL,
+      updated_at INTEGER NOT NULL
     );
-    """)
+    """
+    )
 
-    cur.execute("""
+    cur.execute(
+        """
+    CREATE TABLE IF NOT EXISTS memories (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      student_id TEXT NOT NULL,
+      key TEXT NOT NULL,
+      value TEXT NOT NULL,
+      confidence REAL NOT NULL DEFAULT 0.6,
+      updated_at INTEGER NOT NULL,
+      UNIQUE(student_id, key)
+    );
+    """
+    )
+
+    cur.execute(
+        """
     CREATE TABLE IF NOT EXISTS messages (
       id INTEGER PRIMARY KEY AUTOINCREMENT,
-      session_id TEXT,
-      student_id TEXT,
-      role TEXT,
-      content TEXT,
-      created_at INTEGER
+      session_id TEXT NOT NULL,
+      student_id TEXT NOT NULL,
+      role TEXT NOT NULL,         -- 'student' | 'teacher'
+      content TEXT NOT NULL,
+      meta_json TEXT,
+      created_at INTEGER NOT NULL
     );
-    """)
+    """
+    )
+
+    # session state for demo class flow + chunk progress
+    cur.execute(
+        """
+    CREATE TABLE IF NOT EXISTS class_sessions (
+      session_id TEXT PRIMARY KEY,
+      student_id TEXT NOT NULL,
+      phase TEXT NOT NULL DEFAULT 'ask_name',   -- ask_name | ask_language | teaching | ended
+      student_name TEXT,
+      language_pref TEXT,                       -- English | Hindi | Both
+      board TEXT,
+      grade TEXT,
+      subject TEXT,
+      chapter_name TEXT,
+      chapter_id TEXT,                          -- Supabase chapters.id (uuid as text)
+      next_chunk_no INTEGER NOT NULL DEFAULT 1,
+      total_chunks INTEGER,
+      updated_at INTEGER NOT NULL
+    );
+    """
+    )
 
     conn.commit()
     conn.close()
@@ -68,17 +116,49 @@ def init_db() -> None:
 init_db()
 
 
-def set_memory(student_id: str, key: str, value: str) -> None:
+def now_ts() -> int:
+    return int(time.time())
+
+
+def upsert_student(student_id: str) -> None:
+    now = now_ts()
+    conn = _db()
+    cur = conn.cursor()
+    cur.execute("SELECT student_id FROM students WHERE student_id=?", (student_id,))
+    row = cur.fetchone()
+    if row:
+        cur.execute("UPDATE students SET updated_at=? WHERE student_id=?", (now, student_id))
+    else:
+        cur.execute(
+            "INSERT INTO students(student_id, created_at, updated_at) VALUES(?,?,?)",
+            (student_id, now, now),
+        )
+    conn.commit()
+    conn.close()
+
+
+def save_message(session_id: str, student_id: str, role: str, content: str, meta: Optional[dict]) -> None:
+    conn = _db()
+    cur = conn.cursor()
+    cur.execute(
+        "INSERT INTO messages(session_id, student_id, role, content, meta_json, created_at) VALUES(?,?,?,?,?,?)",
+        (session_id, student_id, role, content, json.dumps(meta or {}, ensure_ascii=False), now_ts()),
+    )
+    conn.commit()
+    conn.close()
+
+
+def set_memory(student_id: str, key: str, value: str, confidence: float = 0.7) -> None:
     conn = _db()
     cur = conn.cursor()
     cur.execute(
         """
-        INSERT INTO memories(student_id,key,value)
-        VALUES(?,?,?)
-        ON CONFLICT(student_id,key)
-        DO UPDATE SET value=excluded.value
+        INSERT INTO memories(student_id, key, value, confidence, updated_at)
+        VALUES(?,?,?,?,?)
+        ON CONFLICT(student_id, key)
+        DO UPDATE SET value=excluded.value, confidence=excluded.confidence, updated_at=excluded.updated_at
         """,
-        (student_id, key, value),
+        (student_id, key, value, float(confidence), now_ts()),
     )
     conn.commit()
     conn.close()
@@ -87,61 +167,74 @@ def set_memory(student_id: str, key: str, value: str) -> None:
 def get_memories(student_id: str) -> Dict[str, str]:
     conn = _db()
     cur = conn.cursor()
-    cur.execute("SELECT key,value FROM memories WHERE student_id=?", (student_id,))
+    cur.execute("SELECT key, value FROM memories WHERE student_id=? ORDER BY updated_at DESC", (student_id,))
     rows = cur.fetchall()
     conn.close()
     return {r["key"]: r["value"] for r in rows}
 
 
-def save_message(session_id: str, student_id: str, role: str, content: str) -> None:
+def get_recent_messages(student_id: str, session_id: str, limit: int = 12) -> List[Dict[str, str]]:
     conn = _db()
     cur = conn.cursor()
     cur.execute(
-        "INSERT INTO messages(session_id,student_id,role,content,created_at) VALUES(?,?,?,?,?)",
-        (session_id, student_id, role, content, int(time.time())),
+        """
+        SELECT role, content
+        FROM messages
+        WHERE student_id=? AND session_id=?
+        ORDER BY id DESC
+        LIMIT ?
+        """,
+        (student_id, session_id, int(limit)),
     )
+    rows = cur.fetchall()
+    conn.close()
+    return [{"role": r["role"], "content": r["content"]} for r in rows[::-1]]
+
+
+def get_or_create_class_session(student_id: str, session_id: str) -> Dict[str, Any]:
+    conn = _db()
+    cur = conn.cursor()
+    cur.execute("SELECT * FROM class_sessions WHERE session_id=?", (session_id,))
+    row = cur.fetchone()
+    if row:
+        conn.close()
+        return dict(row)
+
+    cur.execute(
+        """
+        INSERT INTO class_sessions(session_id, student_id, phase, updated_at)
+        VALUES(?,?,?,?)
+        """,
+        (session_id, student_id, "ask_name", now_ts()),
+    )
+    conn.commit()
+    cur.execute("SELECT * FROM class_sessions WHERE session_id=?", (session_id,))
+    row = cur.fetchone()
+    conn.close()
+    return dict(row) if row else {}
+
+
+def update_class_session(session_id: str, **fields: Any) -> None:
+    if not fields:
+        return
+    fields["updated_at"] = now_ts()
+    keys = list(fields.keys())
+    sets = ", ".join([f"{k}=?" for k in keys])
+    vals = [fields[k] for k in keys] + [session_id]
+    conn = _db()
+    cur = conn.cursor()
+    cur.execute(f"UPDATE class_sessions SET {sets} WHERE session_id=?", vals)
     conn.commit()
     conn.close()
 
 
-# ----------------------------
-# Models
-# ----------------------------
-class RespondRequest(BaseModel):
-    action: str = Field(default="respond")  # "start_class" | "respond"
-    student_input: str = Field(default="")
-    student_id: Optional[str] = None
-    session_id: Optional[str] = None
-    board: Optional[str] = None
-    grade: Optional[str] = None
-    subject: Optional[str] = None
-    chapter: Optional[str] = None
-
-
-class RespondResponse(BaseModel):
-    text: str
-    student_id: str
-    session_id: str
-
-
-# ----------------------------
-# Helpers
-# ----------------------------
+# ============================
+# Parsing helpers
+# ============================
 NAME_RE = re.compile(r"\b(my name is|i am|i'm)\s+([A-Za-z][A-Za-z\s]{1,30})\b", re.I)
+LANG_RE = re.compile(r"\b(english|hindi|both)\b", re.I)
 
-
-def greeting() -> str:
-    h = time.localtime().tm_hour
-    if 5 <= h < 12:
-        return "Good morning"
-    if 12 <= h < 17:
-        return "Good afternoon"
-    if 17 <= h < 22:
-        return "Good evening"
-    return "Hello"
-
-
-def normalize(text: str) -> str:
+def normalize_student_text(text: str) -> str:
     t = (text or "").strip()
     t = re.sub(r"\bhell teacher\b", "hello teacher", t, flags=re.I)
     t = re.sub(r"\bhelo\b", "hello", t, flags=re.I)
@@ -149,290 +242,444 @@ def normalize(text: str) -> str:
     return t
 
 
-def pick_lang(text: str) -> str:
-    t = (text or "").strip().lower()
-    if "both" in t or "hinglish" in t or ("english" in t and "hindi" in t):
-        return "BOTH"
-    if "hindi" in t or t in {"hi", "h"}:
-        return "HI"
-    if "english" in t or t in {"en", "e"}:
-        return "EN"
-    return ""
-
-
-def say(en: str, hi: str, mode: str) -> str:
-    # BOTH = Hinglish full time (English + Hindi)
-    if mode == "HI":
-        return hi or en
-    if mode == "BOTH":
-        if hi:
-            return f"{en} {hi}".strip()
-        return en
-    return en
-
-
-def try_extract_name(text: str) -> str:
-    t = (text or "").strip()
+def extract_name(text: str) -> Optional[str]:
+    t = text.strip()
     m = NAME_RE.search(t)
     if m:
-        return m.group(2).strip().title()
-    words = re.findall(r"[A-Za-z]{2,20}", t)
-    if not words:
-        return ""
-    bad = {"english", "hindi", "both", "science", "teacher"}
-    if words[0].lower() in bad:
-        return ""
-    return words[0].title()
+        name = m.group(2).strip()
+        name = re.sub(r"\s+", " ", name)
+        # keep it short and safe
+        if 1 <= len(name) <= 32:
+            return name
+    # fallback: if user just typed one word like "Ranjan"
+    if 1 <= len(t) <= 20 and re.fullmatch(r"[A-Za-z]+", t):
+        return t
+    return None
 
 
-def correct(ans: str, keys: List[str]) -> bool:
-    a = (ans or "").lower()
-    return any((k or "").lower() in a for k in keys if k)
+def extract_language_pref(text: str) -> Optional[str]:
+    t = text.strip().lower()
+    m = LANG_RE.search(t)
+    if not m:
+        return None
+    w = m.group(1).lower()
+    if w == "english":
+        return "English"
+    if w == "hindi":
+        return "Hindi"
+    if w == "both":
+        return "Both"
+    return None
 
 
-def safe_int(s: str, default: int = 0) -> int:
-    try:
-        return int(s)
-    except Exception:
-        return default
+def time_greeting() -> str:
+    hr = time.localtime().tm_hour
+    if 5 <= hr < 12:
+        return "Good morning"
+    if 12 <= hr < 17:
+        return "Good afternoon"
+    if 17 <= hr < 22:
+        return "Good evening"
+    return "Hello"
 
 
-# ----------------------------
-# Supabase Chunk Loader
-# ----------------------------
-SUPABASE_URL = (os.getenv("SUPABASE_URL") or "").strip()
-SUPABASE_SERVICE_ROLE_KEY = (os.getenv("SUPABASE_SERVICE_ROLE_KEY") or "").strip()
-
-# Table expected: chapter_chunks
-# Minimal columns supported by this loader:
-# - board (text), grade (text), subject (text), chapter (text)
-# - seq (int)
-# - title (text)
-# - teach_en (text) OR chunk_text (text)
-# - teach_hi (text) optional
-# - question_en (text) optional
-# - question_hi (text) optional
-# - expected_keywords (text) optional  (csv OR json array)
-# - is_active (bool)
-#
-# It will fall back safely if some columns are missing.
+def language_rule(lang: str) -> str:
+    if lang == "Hindi":
+        return "Respond in simple Hinglish (Hindi + English), friendly and clear."
+    if lang == "Both":
+        return "Respond in a mix of simple English + simple Hindi (Hinglish), friendly and clear."
+    return "Respond in simple Indian English, friendly and clear."
 
 
-def _parse_keywords(val: Any) -> List[str]:
-    if val is None:
-        return []
-    if isinstance(val, list):
-        return [str(x).strip() for x in val if str(x).strip()]
-    if isinstance(val, str):
-        s = val.strip()
-        if not s:
-            return []
-        # try JSON list
-        if s.startswith("[") and s.endswith("]"):
-            try:
-                arr = json.loads(s)
-                if isinstance(arr, list):
-                    return [str(x).strip() for x in arr if str(x).strip()]
-            except Exception:
-                pass
-        # csv
-        return [p.strip() for p in s.split(",") if p.strip()]
-    return []
+# ============================
+# Supabase loader (chapters + chunks)
+# ============================
+_chapter_cache: Dict[Tuple[str, str, str, str], Dict[str, Any]] = {}
+_chunks_cache: Dict[str, List[Dict[str, Any]]] = {}
 
-
-async def load_chunks_from_supabase(board: str, grade: str, subject: str, chapter: str) -> List[Dict[str, Any]]:
-    """
-    Loads ordered chunks from Supabase REST.
-    Uses service role key (backend only). Never expose this key to frontend.
-    Returns a list in the same shape used by the teaching loop.
-    """
+async def sb_get_json(path: str) -> Any:
     if not SUPABASE_URL or not SUPABASE_SERVICE_ROLE_KEY:
-        return []
+        raise HTTPException(
+            status_code=500,
+            detail="Supabase not configured. Set SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY.",
+        )
 
-    # Lazy import: keep dependencies minimal (httpx is already used in your project earlier)
     import httpx
 
-    base = SUPABASE_URL.rstrip("/")
-    url = f"{base}/rest/v1/chapter_chunks"
-
-    # We request a superset of fields; Supabase will return only existing columns.
-    # If some columns don't exist, it still works as long as the table exists.
-    select = ",".join(
-        [
-            "board",
-            "grade",
-            "subject",
-            "chapter",
-            "seq",
-            "title",
-            "teach_en",
-            "teach_hi",
-            "chunk_text",
-            "question_en",
-            "question_hi",
-            "check_q_en",
-            "check_q_hi",
-            "expected_keywords",
-            "is_active",
-        ]
-    )
-
-    params = {
-        "select": select,
-        "board": f"eq.{board}",
-        "grade": f"eq.{grade}",
-        "subject": f"eq.{subject}",
-        "chapter": f"eq.{chapter}",
-        "is_active": "eq.true",
-        "order": "seq.asc",
-    }
-
+    url = f"{SUPABASE_URL}/rest/v1/{path.lstrip('/')}"
     headers = {
         "apikey": SUPABASE_SERVICE_ROLE_KEY,
         "Authorization": f"Bearer {SUPABASE_SERVICE_ROLE_KEY}",
         "Accept": "application/json",
     }
+    async with httpx.AsyncClient(timeout=25.0) as client:
+        r = await client.get(url, headers=headers)
+        if r.status_code >= 400:
+            raise HTTPException(status_code=502, detail=f"Supabase error: {r.status_code} {r.text}")
+        return r.json()
 
-    try:
-        async with httpx.AsyncClient(timeout=20.0) as client:
-            r = await client.get(url, params=params, headers=headers)
-            if r.status_code >= 400:
-                # minimal log only
-                print(f"[Supabase] chunk load failed: {r.status_code} {r.text[:200]}")
-                return []
-            rows = r.json()
-            if not isinstance(rows, list):
-                return []
-    except Exception as e:
-        print(f"[Supabase] chunk load exception: {e}")
-        return []
 
-    chunks: List[Dict[str, Any]] = []
-    for row in rows:
-        if not isinstance(row, dict):
-            continue
+async def load_chapter(board: str, grade: str, subject: str, chapter_name: str) -> Dict[str, Any]:
+    key = (board, grade, subject, chapter_name)
+    if key in _chapter_cache:
+        return _chapter_cache[key]
 
-        title = (row.get("title") or "").strip() or "Chunk"
-        teach_en = (row.get("teach_en") or row.get("chunk_text") or "").strip()
-        teach_hi = (row.get("teach_hi") or "").strip()
+    # NOTE: your column is chapter_name (not chapter)
+    q = (
+        "chapters?"
+        "select=id,board,grade,subject,chapter_name,chapter_no,summary,estimated_minutes,is_active"
+        f"&board=eq.{_url_escape(board)}"
+        f"&grade=eq.{_url_escape(grade)}"
+        f"&subject=eq.{_url_escape(subject)}"
+        f"&chapter_name=eq.{_url_escape(chapter_name)}"
+        "&limit=1"
+    )
+    rows = await sb_get_json(q)
+    if not rows:
+        raise HTTPException(
+            status_code=404,
+            detail=f"Chapter not found in Supabase: {board} / {grade} / {subject} / {chapter_name}",
+        )
+    chap = rows[0]
+    _chapter_cache[key] = chap
+    return chap
 
-        # support either question_en/question_hi OR check_q_en/check_q_hi
-        q_en = (row.get("question_en") or row.get("check_q_en") or "").strip()
-        q_hi = (row.get("question_hi") or row.get("check_q_hi") or "").strip()
 
-        seq = safe_int(str(row.get("seq") or "0"), 0)
+async def load_chunks(chapter_id: str) -> List[Dict[str, Any]]:
+    if chapter_id in _chunks_cache:
+        return _chunks_cache[chapter_id]
 
-        keywords = _parse_keywords(row.get("expected_keywords"))
-        # if keywords missing, try to auto-create from question (very weak fallback)
-        if not keywords and q_en:
-            keywords = []
+    q = (
+        "chapter_chunks?"
+        "select=chapter_id,chunk_no,title,chunk_text,check_question,expected_answer,difficulty,duration_sec,is_active"
+        f"&chapter_id=eq.{_url_escape(chapter_id)}"
+        "&is_active=eq.true"
+        "&order=chunk_no.asc"
+        "&limit=5000"
+    )
+    rows = await sb_get_json(q)
+    if not rows:
+        raise HTTPException(status_code=404, detail="No chunks found for this chapter_id in Supabase.")
+    _chunks_cache[chapter_id] = rows
+    return rows
 
-        chunks.append(
-            {
-                "seq": seq,
-                "title": title,
-                "teach_en": teach_en,
-                "teach_hi": teach_hi,
-                "question_en": q_en,
-                "question_hi": q_hi,
-                "keywords": keywords,
-            }
+
+def _url_escape(v: str) -> str:
+    # Supabase REST uses URL params; we must escape minimal unsafe characters.
+    # Keep simple: replace spaces with %20 and commas with %2C etc.
+    from urllib.parse import quote
+    return quote(str(v), safe="")
+
+
+# ============================
+# OpenAI (optional)
+# ============================
+async def llm_chat(system: str, messages: List[Dict[str, str]], temperature: float = 0.6, max_tokens: int = 450) -> str:
+    if not OPENAI_API_KEY:
+        # no key: deterministic fallback
+        last_user = next((m["content"] for m in reversed(messages) if m["role"] == "user"), "")
+        return ("Okay 😊\n" + (last_user[:500] if last_user else "")).strip()
+
+    import httpx
+
+    payload = {
+        "model": OPENAI_MODEL,
+        "messages": [{"role": "system", "content": system}] + messages,
+        "temperature": float(temperature),
+        "max_tokens": int(max_tokens),
+    }
+    headers = {"Authorization": f"Bearer {OPENAI_API_KEY}", "Content-Type": "application/json"}
+    async with httpx.AsyncClient(timeout=35.0) as client:
+        r = await client.post("https://api.openai.com/v1/chat/completions", headers=headers, json=payload)
+        if r.status_code >= 400:
+            raise HTTPException(status_code=502, detail=f"LLM error: {r.status_code} {r.text}")
+        data = r.json()
+        return (data["choices"][0]["message"]["content"] or "").strip()
+
+
+# ============================
+# SYSTEM PROMPT (ready-made)
+# ============================
+def build_system_prompt(session_state: Dict[str, Any]) -> str:
+    """
+    This prompt makes Anaya:
+    - greet by time
+    - use student name often (but naturally)
+    - ask language only once
+    - teach chunk-by-chunk in a 1-hour structure
+    - story-telling style
+    - pediatric-neuro style screening (gentle), adapt explanation
+    - handle repeated questions without looping intro
+    """
+    lang = session_state.get("language_pref") or "English"
+    student_name = session_state.get("student_name") or ""
+    subject = session_state.get("subject") or ""
+    chapter_name = session_state.get("chapter_name") or ""
+    board = session_state.get("board") or ""
+    grade = session_state.get("grade") or ""
+
+    return "\n".join(
+        [
+            "You are **Anaya**, Leaflore’s live demo teacher.",
+            "You sound like a warm, smart human teacher + pediatric neurologist (PhD) who understands how children learn.",
+            "",
+            f"LANGUAGE RULE: {language_rule(lang)}",
+            "",
+            "Hard rules (must follow):",
+            "1) NEVER repeat the same intro lines again and again. If you already asked the name or language once, do NOT ask again.",
+            "2) Keep responses short on voice (2–6 sentences) unless the student asks for detail.",
+            "3) Teach as STORYTELLING + examples. Use tiny stories, simple analogies, everyday objects.",
+            "4) After each chunk, ask exactly ONE quick check question (very short).",
+            "5) If student answers wrong OR says 'I didn't get it', explain again in a simpler way with a new example.",
+            "6) If student repeats the same question: answer again but with a DIFFERENT explanation + example (no frustration).",
+            "7) Be gentle, motivating, and confidence-building. No scolding.",
+            "8) If student seems distracted: ask one friendly re-focus question and continue.",
+            "",
+            "Pediatric-neuro screening behavior (gentle, no medical claims):",
+            "- Watch for signs: confusion, repeating, slow recall, mixing terms, very short answers, avoidance.",
+            "- Then adapt: simplify language, use step-by-step, give one concrete example, ask one micro-question.",
+            "- Do NOT label any disorder. Only adjust teaching style.",
+            "",
+            "Class context (from UI selection):",
+            json.dumps(
+                {
+                    "board": board,
+                    "grade": grade,
+                    "subject": subject,
+                    "chapter_name": chapter_name,
+                    "student_name": student_name,
+                },
+                ensure_ascii=False,
+            ),
+            "",
+            "When teaching chunks:",
+            "- Treat chunk_text as the official content.",
+            "- You may add small examples/stories (2–4 lines).",
+            "- Keep pace so the whole chapter fits ~1 hour.",
+            "",
+            "Voice UI instructions to mention ONCE at start:",
+            "- Student speaks by pressing Speak button below the screen.",
+            "- Student can stop the class by Stop button top-right (and may not restart from beginning).",
+        ]
+    )
+
+
+# ============================
+# Request/Response models
+# ============================
+class RespondRequest(BaseModel):
+    action: str = Field(default="respond")
+    student_input: str = Field(default="")
+
+    student_id: Optional[str] = None
+    session_id: Optional[str] = None
+
+    board: Optional[str] = None
+    grade: Optional[str] = None
+    subject: Optional[str] = None
+    chapter: Optional[str] = None  # UI field; maps to chapter_name in DB
+    language: Optional[str] = None  # optional; we still ask if missing
+
+
+class RespondResponse(BaseModel):
+    text: str
+    student_id: str
+    session_id: str
+    phase: str
+    next_chunk_no: int
+
+
+# ============================
+# Teaching engine (state machine)
+# ============================
+def ensure_session_meta(session_state: Dict[str, Any], meta: Dict[str, Any]) -> Dict[str, Any]:
+    # prefer existing session, else accept from request meta
+    for k_src, k_dst in [
+        ("board", "board"),
+        ("grade", "grade"),
+        ("subject", "subject"),
+        ("chapter", "chapter_name"),
+    ]:
+        if not session_state.get(k_dst) and meta.get(k_src):
+            session_state[k_dst] = str(meta.get(k_src)).strip()
+
+    # normalize: UI sometimes sends grade int-like
+    if session_state.get("grade") is not None:
+        session_state["grade"] = str(session_state["grade"]).strip()
+
+    return session_state
+
+
+async def prepare_chapter_if_needed(session_state: Dict[str, Any]) -> Dict[str, Any]:
+    if session_state.get("chapter_id"):
+        return session_state
+
+    board = (session_state.get("board") or "").strip()
+    grade = (session_state.get("grade") or "").strip()
+    subject = (session_state.get("subject") or "").strip()
+    chapter_name = (session_state.get("chapter_name") or "").strip()
+
+    if not (board and grade and subject and chapter_name):
+        # frontend can still chat without selection, but demo-class requires it
+        return session_state
+
+    chap = await load_chapter(board, grade, subject, chapter_name)
+    chunks = await load_chunks(chap["id"])
+    update_class_session(
+        session_state["session_id"],
+        board=board,
+        grade=grade,
+        subject=subject,
+        chapter_name=chapter_name,
+        chapter_id=str(chap["id"]),
+        total_chunks=len(chunks),
+    )
+    # refresh local
+    session_state["chapter_id"] = str(chap["id"])
+    session_state["total_chunks"] = len(chunks)
+    return session_state
+
+
+def build_intro_text(session_state: Dict[str, Any]) -> str:
+    greeting = time_greeting()
+    subject = session_state.get("subject") or "your subject"
+    return (
+        f"{greeting}! Welcome to Leaflore. My name is Anaya. I am your {subject} teacher. "
+        "What is your name? "
+        "To speak with me, click the Speak button below this screen."
+    )
+
+
+def build_language_question(student_name: str) -> str:
+    nm = student_name.strip() if student_name else "dear student"
+    # per your instruction: “English, Hindi or both” (no Bangla)
+    return (
+        f"Nice to meet you, {nm}! In which language are you comfortable to learn and understand: "
+        "English, Hindi or both?"
+    )
+
+
+def build_start_class_text(session_state: Dict[str, Any]) -> str:
+    student_name = session_state.get("student_name") or "dear student"
+    chapter = session_state.get("chapter_name") or "today’s chapter"
+    return (
+        f"Great, {student_name}! Today we will learn **{chapter}**. "
+        "It will be a one hour class. Before we start, here is how we learn: "
+        "When you want to ask anything, click the Speak button below this screen. "
+        "If you want to stop the class, use the Stop button on the top-right. "
+        "If you stop in the middle, the class ends and you may not restart from the beginning. "
+        "Okay—time starts now."
+    )
+
+
+def is_repeatish(student_text: str, recent_teacher_texts: List[str]) -> bool:
+    t = (student_text or "").strip().lower()
+    if len(t) < 5:
+        return False
+    # if student keeps saying "what" / "repeat" / same short phrase
+    if any(w in t for w in ["repeat", "again", "same", "didn't get", "not understand", "what do you mean"]):
+        return True
+    # crude similarity: exact match with last teacher question fragments
+    for rt in recent_teacher_texts[-3:]:
+        r = (rt or "").strip().lower()
+        if r and t in r:
+            return True
+    return False
+
+
+async def teach_next_chunk(session_state: Dict[str, Any], student_text: str) -> str:
+    """
+    Returns teacher text for the next step in teaching.
+    - If student asks a question, answer it (with chunk context).
+    - Then continue with next chunk.
+    """
+    chapter_id = session_state.get("chapter_id")
+    if not chapter_id:
+        # no selection yet
+        return (
+            "To start the live demo class, please select Board, Class, Subject and Chapter, then click Start Class. "
+            "After that, I will teach chapter-wise in story style."
         )
 
-    # Ensure stable order even if seq missing
-    chunks.sort(key=lambda c: (c.get("seq", 0), c.get("title", "")))
-    return chunks
+    chunks = await load_chunks(chapter_id)
+    next_no = int(session_state.get("next_chunk_no") or 1)
+    total = len(chunks)
+
+    # Bound
+    if next_no > total:
+        update_class_session(session_state["session_id"], phase="ended")
+        return (
+            f"Wonderful, {session_state.get('student_name') or ''}! We completed the chapter. "
+            "Before we end, tell me one thing you learned today in one sentence."
+        ).strip()
+
+    # Current chunk
+    chunk = next((c for c in chunks if int(c.get("chunk_no")) == next_no), None)
+    if not chunk:
+        update_class_session(session_state["session_id"], phase="ended")
+        return "I could not find the next chunk. Please ask your admin to verify chapter_chunks for this chapter."
+
+    # If student asked something, answer first using LLM (optional)
+    # but do NOT re-run intro; keep within chapter + chunk context.
+    student_name = session_state.get("student_name") or ""
+    lang_pref = session_state.get("language_pref") or "English"
+
+    # Build “teaching response” for this chunk
+    chunk_title = chunk.get("title") or f"Chunk {next_no}"
+    chunk_text = chunk.get("chunk_text") or ""
+    check_q = chunk.get("check_question") or "Quick check: what did you understand?"
+    expected = chunk.get("expected_answer") or ""
+
+    # Determine whether student is asking a question OR just continuing
+    student_t = (student_text or "").strip()
+    wants_continue = student_t == "" or student_t.lower() in ["ok", "okay", "yes", "start", "go", "next", "continue"]
+
+    # Compose the teacher response:
+    # - chunk teaching (short)
+    # - 1 check question
+    # - advance chunk number after delivering teaching (so next user answer corresponds to check)
+    # We advance immediately so flow continues smoothly.
+    update_class_session(session_state["session_id"], phase="teaching", next_chunk_no=next_no + 1)
+
+    # If OpenAI key exists, let model paraphrase chunk nicely in story style + adapt language
+    if OPENAI_API_KEY:
+        system = build_system_prompt(session_state)
+        msgs = [
+            {
+                "role": "user",
+                "content": (
+                    f"Deliver chunk {next_no}/{total} as voice-friendly story teaching.\n"
+                    f"Chunk title: {chunk_title}\n"
+                    f"Chunk text: {chunk_text}\n"
+                    f"Student just said: {student_t!r}\n"
+                    f"Now teach this chunk and ask ONE quick check question.\n"
+                    f"Use student name naturally: {student_name}\n"
+                    f"Language pref: {lang_pref}\n"
+                    f"Check question to ask (use this): {check_q}\n"
+                    f"Expected answer (for your internal sense): {expected}\n"
+                    "Do not mention 'chunk'. Do not repeat intro. Keep it concise."
+                ),
+            }
+        ]
+        return await llm_chat(system, msgs, temperature=0.55, max_tokens=420)
+
+    # No OpenAI: direct chunk text + question (still usable)
+    prefix = f"{student_name}, " if student_name else ""
+    return (
+        f"{prefix}{chunk_title}.\n"
+        f"{chunk_text}\n\n"
+        f"{check_q}"
+    ).strip()
 
 
-def get_cached_chunks(mem: Dict[str, str]) -> List[Dict[str, Any]]:
-    raw = mem.get("chunks_json", "")
-    if not raw:
-        return []
-    try:
-        data = json.loads(raw)
-        if isinstance(data, list):
-            return data
-    except Exception:
-        return []
-    return []
-
-
-def cache_chunks(student_id: str, chunks_key: str, chunks: List[Dict[str, Any]]) -> None:
-    set_memory(student_id, "chunks_key", chunks_key)
-    set_memory(student_id, "chunks_json", json.dumps(chunks, ensure_ascii=False))
-
-
-# ----------------------------
-# DEMO fallback chunks (used only if Supabase has no chunks yet)
-# ----------------------------
-DEMO_CHUNKS: List[Dict[str, Any]] = [
-    {
-        "seq": 1,
-        "title": "Leaf Structure",
-        "teach_en": "A leaf is the food factory of a plant. The flat green part is called lamina. The main line in the middle is midrib. Small lines are veins. The stalk is petiole.",
-        "teach_hi": "Leaf plant ka food factory hota hai. Flat green part ko lamina kehte hain. Beech ki line midrib hoti hai. Chhoti lines veins hoti hain. Dandi ko petiole kehte hain.",
-        "question_en": "What is the middle line of a leaf called?",
-        "question_hi": "Leaf ki beech wali line ko kya kehte hain?",
-        "keywords": ["midrib"],
-    },
-    {
-        "seq": 2,
-        "title": "Types of Leaves",
-        "teach_en": "Some leaves are simple like mango. Some are compound like neem. Compound leaves have many small leaflets.",
-        "teach_hi": "Kuch leaves simple hoti hain jaise aam. Kuch compound hoti hain jaise neem. Compound leaves mein chhote leaflets hote hain.",
-        "question_en": "Neem leaf is simple or compound?",
-        "question_hi": "Neem simple hai ya compound?",
-        "keywords": ["compound"],
-    },
-    {
-        "seq": 3,
-        "title": "Venation",
-        "teach_en": "Venation means pattern of veins. Net pattern is reticulate. Side by side pattern is parallel.",
-        "teach_hi": "Venation matlab veins ka pattern. Net pattern reticulate hota hai. Side by side parallel hota hai.",
-        "question_en": "Grass has reticulate or parallel venation?",
-        "question_hi": "Grass mein reticulate hota hai ya parallel?",
-        "keywords": ["parallel"],
-    },
-    {
-        "seq": 4,
-        "title": "Leaf Modification",
-        "teach_en": "Cactus leaves become spines to save water. Some leaves become tendrils to climb.",
-        "teach_hi": "Cactus ki leaves pani bachane ke liye spines ban jaati hain. Kuch leaves climbing ke liye tendrils ban jaati hain.",
-        "question_en": "Why do cactus leaves become spines?",
-        "question_hi": "Cactus ki leaves spines kyun ban jaati hain?",
-        "keywords": ["water", "save", "loss"],
-    },
-]
-
-
-def _get_selected(req: RespondRequest, mem: Dict[str, str]) -> Dict[str, str]:
-    board = (req.board or mem.get("selected_board") or "ICSE").strip()
-    grade = (req.grade or mem.get("selected_grade") or "6").strip()
-    subject = (req.subject or mem.get("selected_subject") or "Science").strip()
-    chapter = (req.chapter or mem.get("selected_chapter") or "The Leaf").strip()
-    return {"board": board, "grade": grade, "subject": subject, "chapter": chapter}
-
-
-def _teach_chunk_text(mode: str, student_name: str, chunk: Dict[str, Any]) -> str:
-    # tiny storytelling hook (kept short)
-    hook_en = f"Okay {student_name}, imagine you are a tiny explorer inside this chapter."
-    hook_hi = f"Okay {student_name}, socho tum ek tiny explorer ho is chapter ke andar."
-    hook = say(hook_en, hook_hi, mode)
-
-    teach = say(chunk.get("teach_en", "") or "", chunk.get("teach_hi", "") or "", mode).strip()
-    q = say(chunk.get("question_en", "") or "", chunk.get("question_hi", "") or "", mode).strip()
-
-    out = hook
-    if teach:
-        out += " " + teach
-    if q:
-        out += "\n\n" + q
-    return out.strip()
-
-
-# ----------------------------
+# ============================
 # Routes
-# ----------------------------
+# ============================
+@app.get("/")
+def root():
+    return {"service": "Leaflore Brain API", "health": "/health", "respond": "/respond"}
+
+
 @app.get("/health")
 def health():
     return {"status": "ok"}
@@ -441,151 +688,129 @@ def health():
 @app.post("/respond", response_model=RespondResponse)
 async def respond(req: RespondRequest, request: Request):
     student_id = (req.student_id or "").strip() or "anonymous"
-    session_id = (req.session_id or "").strip() or "default"
+    session_id = (req.session_id or "").strip() or request.headers.get("x-session-id") or "default-session"
 
-    mem = get_memories(student_id)
-    sel = _get_selected(req, mem)
+    upsert_student(student_id)
 
-    # persist selections
-    set_memory(student_id, "selected_board", sel["board"])
-    set_memory(student_id, "selected_grade", sel["grade"])
-    set_memory(student_id, "selected_subject", sel["subject"])
-    set_memory(student_id, "selected_chapter", sel["chapter"])
+    student_text = normalize_student_text(req.student_input or "")
+    meta = req.model_dump(exclude_none=True)
 
-    student_text = normalize(req.student_input)
+    # Save student msg (only if they said something)
+    if student_text.strip():
+        save_message(session_id, student_id, "student", student_text, meta)
 
-    # ----------------------------
-    # START CLASS: load chunks from Supabase and cache them
-    # ----------------------------
-    if (req.action or "").strip() == "start_class":
-        set_memory(student_id, "step", "ASK_NAME")
-        set_memory(student_id, "chunk_index", "0")
+    # Load / create session state
+    s = get_or_create_class_session(student_id, session_id)
+    s["session_id"] = session_id
+    s = ensure_session_meta(s, meta)
 
-        chunks_key = f'{sel["board"]}|{sel["grade"]}|{sel["subject"]}|{sel["chapter"]}'
-        chunks: List[Dict[str, Any]] = []
+    # If UI passed a language explicitly, store it (but still ask if missing)
+    if meta.get("language") and not s.get("language_pref"):
+        lp = extract_language_pref(str(meta["language"]))
+        if lp:
+            update_class_session(session_id, language_pref=lp)
+            s["language_pref"] = lp
 
-        # Load from Supabase first
-        chunks = await load_chunks_from_supabase(sel["board"], sel["grade"], sel["subject"], sel["chapter"])
-        if not chunks:
-            # fallback to demo chunks (so class never breaks)
-            chunks = DEMO_CHUNKS
+    # Prepare chapter_id if selection is present
+    s = await prepare_chapter_if_needed(s)
 
-        cache_chunks(student_id, chunks_key, chunks)
+    phase = s.get("phase") or "ask_name"
 
-        text = (
-            f"{greeting()}! Welcome to Leaflore. My name is Anaya. "
-            f'I am your {sel["subject"]} teacher. What is your name? '
-            "To speak with me, click the Speak button below this screen."
-        )
-        save_message(session_id, student_id, "teacher", text)
-        return RespondResponse(text=text, student_id=student_id, session_id=session_id)
+    # --- Phase: ask_name ---
+    if phase == "ask_name":
+        name = extract_name(student_text) if student_text else None
+        if name:
+            set_memory(student_id, "student_name", name, 0.85)
+            update_class_session(session_id, student_name=name, phase="ask_language")
+            teacher_text = build_language_question(name)
+            save_message(session_id, student_id, "teacher", teacher_text, meta)
+            return RespondResponse(text=teacher_text, student_id=student_id, session_id=session_id, phase="ask_language", next_chunk_no=int(s.get("next_chunk_no") or 1))
 
-    # Save student message (non-empty)
-    if student_text:
-        save_message(session_id, student_id, "student", student_text)
+        # Ask name once (no loopy repeats besides this one phase)
+        teacher_text = build_intro_text(s)
+        save_message(session_id, student_id, "teacher", teacher_text, meta)
+        return RespondResponse(text=teacher_text, student_id=student_id, session_id=session_id, phase="ask_name", next_chunk_no=int(s.get("next_chunk_no") or 1))
 
-    step = mem.get("step", "ASK_NAME")
-
-    # ASK NAME
-    if step == "ASK_NAME":
-        name = try_extract_name(student_text) or student_text.strip().title()
-        name = (name or "Friend").strip()
-        set_memory(student_id, "student_name", name)
-        set_memory(student_id, "step", "ASK_LANG")
-        text = f"Nice to meet you, {name}! Which language are you comfortable in: English, Hindi or Both?"
-        save_message(session_id, student_id, "teacher", text)
-        return RespondResponse(text=text, student_id=student_id, session_id=session_id)
-
-    # ASK LANGUAGE
-    if step == "ASK_LANG":
-        mode = pick_lang(student_text)
-        if not mode:
-            text = "Please choose: English, Hindi or Both."
-            save_message(session_id, student_id, "teacher", text)
-            return RespondResponse(text=text, student_id=student_id, session_id=session_id)
-
-        set_memory(student_id, "lang", mode)
-        set_memory(student_id, "step", "TEACH")
-
+    # --- Phase: ask_language ---
+    if phase == "ask_language":
+        # If name missing (edge case), fallback to memory
         mem = get_memories(student_id)
-        name = mem.get("student_name", "friend")
+        if not s.get("student_name") and mem.get("student_name"):
+            update_class_session(session_id, student_name=mem["student_name"])
+            s["student_name"] = mem["student_name"]
 
-        intro = say(
-            f"Great {name}! Today we will learn “{sel['chapter']}” in {sel['subject']}. "
-            "This is a one hour class. To ask questions click the Speak button below. "
-            "To stop, click Stop at top right. Time starts now. Let’s begin!",
-            f"Bahut badiya {name}! Aaj hum “{sel['chapter']}” {sel['subject']} mein seekhenge. "
-            "Ye one hour class hai. Question poochne ke liye neeche Speak button dabao. "
-            "Stop karna ho to top right pe Stop dabao. Time start. Chaliye shuru karte hain!",
-            mode,
-        )
-        save_message(session_id, student_id, "teacher", intro)
-        return RespondResponse(text=intro, student_id=student_id, session_id=session_id)
+        lang = extract_language_pref(student_text) if student_text else None
+        if lang:
+            update_class_session(session_id, language_pref=lang, phase="teaching")
+            s["language_pref"] = lang
+            s["phase"] = "teaching"
 
-    # TEACHING
-    if step == "TEACH":
-        mem = get_memories(student_id)
-        mode = mem.get("lang", "EN")
-        name = mem.get("student_name", "friend")
+            # Start class once + then immediately deliver first chunk
+            start_text = build_start_class_text(s)
+            chunk_text = await teach_next_chunk(s, "")  # first chunk
+            teacher_text = f"{start_text}\n\n{chunk_text}".strip()
+            save_message(session_id, student_id, "teacher", teacher_text, meta)
 
-        # ensure cached chunks match current selection; reload if changed
-        chunks_key = f'{sel["board"]}|{sel["grade"]}|{sel["subject"]}|{sel["chapter"]}'
-        cached_key = mem.get("chunks_key", "")
-        chunks = get_cached_chunks(mem)
-
-        if not chunks or cached_key != chunks_key:
-            chunks = await load_chunks_from_supabase(sel["board"], sel["grade"], sel["subject"], sel["chapter"])
-            if not chunks:
-                chunks = DEMO_CHUNKS
-            cache_chunks(student_id, chunks_key, chunks)
-
-        idx = safe_int(mem.get("chunk_index", "0"), 0)
-
-        # If student just answered, validate against previous chunk question
-        if student_text and idx > 0:
-            prev = chunks[min(idx - 1, len(chunks) - 1)]
-            expected = prev.get("keywords") or prev.get("expected_keywords") or []
-            if isinstance(expected, str):
-                expected = _parse_keywords(expected)
-            if not isinstance(expected, list):
-                expected = []
-            if expected and not correct(student_text, expected):
-                retry = say(
-                    f"No worries {name}, let me explain that in a simpler way with a quick example. Then try again.",
-                    f"Koi baat nahi {name}, main simple example ke saath phir se samjhati hoon. Phir aap try karo.",
-                    mode,
-                )
-                # Repeat the same question again (do not advance idx)
-                q = say(
-                    prev.get("question_en", "") or "Try again:",
-                    prev.get("question_hi", "") or "Phir se try karo:",
-                    mode,
-                )
-                text = (retry + "\n\n" + q).strip()
-                save_message(session_id, student_id, "teacher", text)
-                return RespondResponse(text=text, student_id=student_id, session_id=session_id)
-
-        # End condition
-        if idx >= len(chunks):
-            end_text = say(
-                f"Excellent {name}! Demo class completed. Do you want a quick revision or a fun quiz?",
-                f"Excellent {name}! Demo class complete. Quick revision karni hai ya fun quiz?",
-                mode,
+            # refresh next chunk for response
+            ss2 = get_or_create_class_session(student_id, session_id)
+            return RespondResponse(
+                text=teacher_text,
+                student_id=student_id,
+                session_id=session_id,
+                phase="teaching",
+                next_chunk_no=int(ss2.get("next_chunk_no") or 1),
             )
-            save_message(session_id, student_id, "teacher", end_text)
-            return RespondResponse(text=end_text, student_id=student_id, session_id=session_id)
 
-        # Teach next chunk
-        chunk = chunks[idx]
-        text = _teach_chunk_text(mode, name, chunk)
+        # Ask language again (but differently) without restarting intro
+        nm = s.get("student_name") or "dear student"
+        teacher_text = (
+            f"{nm}, tell me your preferred language: English, Hindi or both."
+        )
+        save_message(session_id, student_id, "teacher", teacher_text, meta)
+        return RespondResponse(text=teacher_text, student_id=student_id, session_id=session_id, phase="ask_language", next_chunk_no=int(s.get("next_chunk_no") or 1))
 
-        # Advance pointer
-        set_memory(student_id, "chunk_index", str(idx + 1))
+    # --- Phase: teaching ---
+    if phase == "teaching":
+        # If student asks stop/end
+        t = (student_text or "").lower()
+        if any(x in t for x in ["stop class", "end class", "end", "stop"]):
+            update_class_session(session_id, phase="ended")
+            teacher_text = "Okay. I’m stopping the class now. See you next time 😊"
+            save_message(session_id, student_id, "teacher", teacher_text, meta)
+            return RespondResponse(text=teacher_text, student_id=student_id, session_id=session_id, phase="ended", next_chunk_no=int(s.get("next_chunk_no") or 1))
 
-        save_message(session_id, student_id, "teacher", text)
-        return RespondResponse(text=text, student_id=student_id, session_id=session_id)
+        # Prevent “brain stops after language”: always continue with chunk teaching
+        teacher_text = await teach_next_chunk(s, student_text)
 
-    # Fallback (should rarely happen)
-    text = "Let’s continue learning."
-    save_message(session_id, student_id, "teacher", text)
-    return RespondResponse(text=text, student_id=student_id, session_id=session_id)
+        save_message(session_id, student_id, "teacher", teacher_text, meta)
+
+        ss2 = get_or_create_class_session(student_id, session_id)
+        return RespondResponse(
+            text=teacher_text,
+            student_id=student_id,
+            session_id=session_id,
+            phase=str(ss2.get("phase") or "teaching"),
+            next_chunk_no=int(ss2.get("next_chunk_no") or 1),
+        )
+
+    # --- Phase: ended ---
+    teacher_text = "Class is already ended. If you want to start again, please click Start Class again from the beginning."
+    save_message(session_id, student_id, "teacher", teacher_text, meta)
+    return RespondResponse(text=teacher_text, student_id=student_id, session_id=session_id, phase="ended", next_chunk_no=int(s.get("next_chunk_no") or 1))
+
+
+@app.get("/history")
+def history(student_id: str, session_id: str, limit: int = 50):
+    limit = max(1, min(int(limit), 200))
+    msgs = get_recent_messages(student_id, session_id, limit=limit)
+    return {"student_id": student_id, "session_id": session_id, "messages": msgs}
+
+
+@app.get("/debug/session")
+def debug_session(session_id: str):
+    conn = _db()
+    cur = conn.cursor()
+    cur.execute("SELECT * FROM class_sessions WHERE session_id=?", (session_id,))
+    row = cur.fetchone()
+    conn.close()
+    return {"session": dict(row) if row else None}

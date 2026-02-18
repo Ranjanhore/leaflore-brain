@@ -142,12 +142,17 @@ def _get_teacher_profile(chapter_id: str) -> Dict[str, Any]:
 def _load_chunks(chapter_id: str) -> List[Dict[str, Any]]:
     res = (
         supabase.table("chapter_chunks")
-        .select("id,chapter_id,seq,type,title,text,media_url,duration_sec,quiz,is_active")
+        .select(
+            "id,chapter_id,seq,type,title,chunk_text,media_url,duration_sec,quiz,is_active"
+        )
         .eq("chapter_id", chapter_id)
         .eq("is_active", True)
         .order("seq")
         .execute()
     )
+    data = res.data or []
+    return data
+
     return res.data or []
 
 def _get_state_key(student_id: str, session_id: str, chapter_id: str) -> str:

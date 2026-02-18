@@ -1,6 +1,7 @@
 # main.py
 import os
 import re
+import time
 from typing import Optional, Any, Dict, List, Literal
 
 from fastapi import FastAPI, HTTPException
@@ -12,7 +13,7 @@ from supabase import create_client, Client
 # App
 # ───────────────────────────────────────────────────────────────────────────────
 
-app = FastAPI(title="Leaflore Brain", version="3.0.0")
+app = FastAPI(title="Leaflore Brain", version="3.1.0")
 
 app.add_middleware(
     CORSMiddleware,
@@ -79,7 +80,7 @@ DEFAULT_TEACHER: Dict[str, Any] = {
     "pace": "slow",
     "tone": "gentle",
     "depth": "high",
-    "max_paragraph_words": 65,
+    "max_paragraph_words": 65,  # base (will adapt)
 }
 
 
@@ -129,7 +130,6 @@ def _get_teacher_profile(chapter_id: str) -> Dict[str, Any]:
 def _load_chunks(chapter_id: str) -> List[Dict[str, Any]]:
     """
     Supports your current schema where the column is `chunk_text`.
-    If your table uses `text`, change chunk_text -> text below.
     """
     res = (
         supabase.table("chapter_chunks")
@@ -158,14 +158,14 @@ def _find_next(chunks: List[Dict[str, Any]], current_seq: int) -> Optional[Dict[
 
 # ───────────────────────────────────────────────────────────────────────────────
 # Lifelong Brain + Per-chapter Progress (MODE C)
-#   - student_brain: lifelong memory (one row per student_id)
+#   - student_brain: lifelong memory (one row per student_id) + optional state_key
 #   - student_chapter_progress: progress per (student_id, chapter_id)
 # ───────────────────────────────────────────────────────────────────────────────
 
 def _ensure_student_brain_row(student_id: str) -> None:
     """
     Best-effort: ensure a lifelong row exists for this student.
-    Requires UNIQUE(student_id) index (recommended).
+    If your student_brain also has `state_key`, we set it = student_id (safe).
     """
     try:
         existing = (
@@ -179,16 +179,17 @@ def _ensure_student_brain_row(student_id: str) -> None:
         if existing and existing.get("student_id"):
             return
 
+        # Insert minimal row; if state_key column exists, this still works
+        # (Supabase ignores unknown keys? It will error if column missing; so we keep it minimal)
         supabase.table("student_brain").insert({"student_id": student_id}).execute()
     except Exception:
-        # don't block the session if this fails
         return
 
 
 def _get_progress(student_id: str, chapter_id: str) -> int:
     """
     Reads from student_chapter_progress (lifelong progress).
-    Falls back to -1 if no row.
+    Falls back to -1 if no row or table missing.
     """
     try:
         res = (
@@ -202,7 +203,6 @@ def _get_progress(student_id: str, chapter_id: str) -> int:
         data = res.data or {}
         return int(data.get("chunk_seq") if data.get("chunk_seq") is not None else -1)
     except Exception:
-        # If table doesn't exist yet or query fails, behave like "new chapter"
         return -1
 
 
@@ -217,7 +217,6 @@ def _set_progress(student_id: str, chapter_id: str, chunk_seq: int) -> None:
             on_conflict="student_id,chapter_id",
         ).execute()
     except Exception:
-        # As a fallback, try insert then update
         try:
             supabase.table("student_chapter_progress").insert(
                 {"student_id": student_id, "chapter_id": chapter_id, "chunk_seq": int(chunk_seq)}
@@ -232,7 +231,7 @@ def _set_progress(student_id: str, chapter_id: str, chunk_seq: int) -> None:
 
 
 # ───────────────────────────────────────────────────────────────────────────────
-# Teaching Engine (deterministic)
+# Teaching Engine (deterministic) + B/C Adaptation
 # ───────────────────────────────────────────────────────────────────────────────
 
 def _clean_spaces(s: str) -> str:
@@ -273,21 +272,161 @@ def _limit_paragraph_words(text: str, max_words: int) -> List[str]:
     return blocks
 
 
-def _teach_slowly(raw_text: str, title: str, teacher: Dict[str, Any], chunk_type: str) -> str:
+def _clamp(n: int, lo: int = 0, hi: int = 100) -> int:
+    return max(lo, min(hi, int(n)))
+
+
+def _infer_learning_signals(student_text: str) -> Dict[str, Any]:
+    t = (student_text or "").lower().strip()
+
+    confused = any(k in t for k in [
+        "confused", "not clear", "dont understand", "don't understand", "i don't get", "i dont get",
+        "hard", "difficult", "can't understand", "cannot understand"
+    ])
+    repeat = any(k in t for k in ["repeat", "again", "one more time", "slow", "slowly", "say again"])
+    understood = any(k in t for k in ["understood", "got it", "okay", "ok", "yes", "makes sense", "clear now"])
+    anxious = any(k in t for k in ["scared", "anxious", "panic", "worried", "i can't", "hate", "frustrated", "angry"])
+
+    if anxious or confused:
+        level = "hard"
+    elif understood and not confused:
+        level = "easy"
+    else:
+        level = "normal"
+
+    stress = 50
+    confidence = 50
+
+    if anxious:
+        stress += 25
+        confidence -= 15
+    if confused:
+        stress += 15
+        confidence -= 10
+    if repeat:
+        stress += 8
+        confidence -= 5
+    if understood:
+        stress -= 12
+        confidence += 15
+
+    return {
+        "difficulty_level": level,
+        "confused": confused,
+        "repeat": repeat,
+        "understood": understood,
+        "anxious": anxious,
+        "stress_score": _clamp(stress),
+        "confidence_score": _clamp(confidence),
+    }
+
+
+def _update_student_state(student_id: str, signals: Dict[str, Any]) -> None:
+    """
+    Updates lifelong state in student_brain (row per student_id).
+    Columns you already have: stress_score, confidence_score, brain_state, updated_at, etc.
+    If you also have state_key, we set it to student_id (safe).
+    """
+    brain_state = {
+        "difficulty_level": signals.get("difficulty_level", "normal"),
+        "confused": bool(signals.get("confused")),
+        "repeat": bool(signals.get("repeat")),
+        "understood": bool(signals.get("understood")),
+        "anxious": bool(signals.get("anxious")),
+        "last_student_text": (signals.get("last_student_text") or "")[:240],
+        "updated_at_ms": int(time.time() * 1000),
+    }
+
+    payload: Dict[str, Any] = {
+        "student_id": student_id,
+        "stress_score": int(signals.get("stress_score", 50)),
+        "confidence_score": int(signals.get("confidence_score", 50)),
+        "brain_state": brain_state,
+    }
+
+    try:
+        # try to also set state_key if column exists
+        payload["state_key"] = student_id
+    except Exception:
+        pass
+
+    try:
+        existing = (
+            supabase.table("student_brain")
+            .select("id,student_id")
+            .eq("student_id", student_id)
+            .maybe_single()
+            .execute()
+        ).data
+
+        if existing and existing.get("student_id"):
+            supabase.table("student_brain").update(payload).eq("student_id", student_id).execute()
+        else:
+            supabase.table("student_brain").insert(payload).execute()
+    except Exception:
+        # never block class
+        return
+
+
+def _get_student_brain_state(student_id: str) -> Dict[str, Any]:
+    try:
+        res = (
+            supabase.table("student_brain")
+            .select("stress_score,confidence_score,brain_state")
+            .eq("student_id", student_id)
+            .maybe_single()
+            .execute()
+        )
+        return res.data or {}
+    except Exception:
+        return {}
+
+
+def _teaching_knobs(teacher: Dict[str, Any], student_state: Dict[str, Any]) -> Dict[str, Any]:
+    brain_state = (student_state or {}).get("brain_state") or {}
+    level = str(brain_state.get("difficulty_level") or "normal").lower()
+
+    if level == "hard":
+        return {"max_words": 40, "extra_checks": 2, "more_examples": True, "level": "hard"}
+    if level == "easy":
+        return {"max_words": 80, "extra_checks": 1, "more_examples": False, "level": "easy"}
+    return {
+        "max_words": int(teacher.get("max_paragraph_words") or 65),
+        "extra_checks": 1,
+        "more_examples": True,
+        "level": "normal",
+    }
+
+
+def _teach_slowly(raw_text: str, title: str, teacher: Dict[str, Any], chunk_type: str, student_state: Dict[str, Any]) -> str:
     tname = teacher.get("teacher_name", "Teacher")
     grade = teacher.get("grade", "")
     subject = teacher.get("subject", "")
     chapter_name = teacher.get("chapter_name", "")
 
+    knobs = _teaching_knobs(teacher, student_state)
+    max_words = int(knobs["max_words"])
+    extra_checks = int(knobs["extra_checks"])
+    more_examples = bool(knobs["more_examples"])
+    level = str(knobs["level"])
+
     raw_text = _clean_spaces(raw_text)
     title = _clean_spaces(title)
 
     if chunk_type == "teacher_greeting":
+        # greeting adapts too
+        warmth = (
+            "If anything feels confusing, it is completely okay. "
+            "We will go slowly, and I will repeat as many times as you want.\n\n"
+            if level == "hard"
+            else ""
+        )
         base = (
             f"Hello my dear. I’m {tname}. "
             f"I teach very softly and slowly, step by step. "
             f"I also understand child psychology and how your brain learns best. "
             f"So you can speak freely — no fear, okay?\n\n"
+            f"{warmth}"
         )
         if subject or chapter_name:
             base += f"Today we are doing {subject or 'your subject'}"
@@ -315,28 +454,41 @@ def _teach_slowly(raw_text: str, title: str, teacher: Dict[str, Any], chunk_type
     else:
         script_parts.append("Okay. Now we will learn one important part, slowly.")
 
-    script_parts.append("Please listen calmly. I will speak in small steps.")
-    script_parts.append("Let’s break this into tiny pieces." if len(sentences) > 2 else "Here is the idea in very simple words.")
+    if level == "hard":
+        script_parts.append("We will go very slowly. Small steps. No hurry.")
+    else:
+        script_parts.append("Please listen calmly. I will speak in small steps.")
 
-    max_words = int(teacher.get("max_paragraph_words") or 65)
+    script_parts.append(
+        "Let’s break this into tiny pieces." if len(sentences) > 2 else "Here is the idea in very simple words."
+    )
+
     joined = " ".join(sentences).strip()
     for block in _limit_paragraph_words(joined, max_words=max_words):
         script_parts.append(block)
-        script_parts.append("Pause. Are you with me till here?")
-        script_parts.append("If you want, say: repeat slowly.")
+        for _ in range(extra_checks):
+            script_parts.append("Pause. Are you with me till here?")
+            script_parts.append("If you want, say: repeat slowly.")
 
-    script_parts.append("Now, a tiny example to make it easy.")
-    script_parts.append("Imagine you are explaining this to a younger friend in one line.")
+    if more_examples:
+        script_parts.append("Now, a tiny example to make it easy.")
+        script_parts.append("Imagine you are explaining this to a younger friend in one line.")
+    else:
+        script_parts.append("Quick example in one line: say it in your own words.")
+
     script_parts.append("Quick check question.")
     script_parts.append("Tell me: what is the main point you understood? Just one sentence.")
 
     return "\n\n".join([p.strip() for p in script_parts if p.strip()]).strip()
 
 
-def _teacher_reply(student_text: str, current_chunk: Optional[Dict[str, Any]], teacher: Dict[str, Any]) -> str:
+def _teacher_reply(student_text: str, current_chunk: Optional[Dict[str, Any]], teacher: Dict[str, Any], student_state: Dict[str, Any]) -> str:
     student_text = _clean_spaces(student_text)
     if not student_text:
         return "I’m here. Tell me your question slowly, in simple words."
+
+    knobs = _teaching_knobs(teacher, student_state)
+    level = str(knobs["level"])
 
     lowered = student_text.lower()
 
@@ -347,32 +499,49 @@ def _teacher_reply(student_text: str, current_chunk: Optional[Dict[str, Any]], t
                 return (
                     "Of course, my dear.\n\n"
                     "I will repeat slowly.\n\n"
-                    f"{_teach_slowly(raw, current_chunk.get('title') or '', teacher, 'chunk')}"
+                    f"{_teach_slowly(raw, current_chunk.get('title') or '', teacher, 'chunk', student_state)}"
                 ).strip()
         return "Of course, my dear. Tell me which line you want me to repeat."
 
     if any(k in lowered for k in ["i don't understand", "dont understand", "confused", "not clear", "hard"]):
+        extra = (
+            "\n\nTake a small breath. You are safe here. "
+            "Tell me only ONE word that feels confusing."
+            if level == "hard"
+            else "\n\nTell me which word feels confusing. I will explain that one word first."
+        )
         return (
             "It’s completely okay.\n\n"
-            "Your brain is learning — confusion is a normal part of learning.\n\n"
-            "Tell me which word feels confusing. I will explain that one word first."
+            "Your brain is learning — confusion is a normal part of learning."
+            f"{extra}"
         ).strip()
 
     cur_title = _clean_spaces((current_chunk or {}).get("title") or "")
+
+    if level == "hard":
+        opener = "Thank you for telling me.\n\nI’m listening very carefully."
+        next_hint = "If you want, ask me to repeat slowly or give one example."
+    elif level == "easy":
+        opener = "Nice. I got you.\n\nTell me your exact doubt in one line."
+        next_hint = "If you’re ready, you can press Next to continue."
+    else:
+        opener = "Thank you for telling me.\n\nI’m listening carefully."
+        next_hint = "If you want to continue the lesson, you can press Next when you are ready."
+
     reply = [
-        f'Thank you for telling me.\n\nYou said: “{student_text}”.',
-        "I’m listening carefully.",
-        "Now I will answer gently.",
+        opener,
+        f'You said: “{student_text}”.',
         "",
-        "First, tell me one detail: are you asking about the meaning, the example, or the diagram/video?",
+        "One quick question so I answer perfectly:",
+        "Are you asking about the meaning, the example, or the diagram/video?",
     ]
     if cur_title:
         reply.append(f"Also, we are currently on: {cur_title}.")
-    reply.append("If you want to continue the lesson, you can press Next when you are ready.")
+    reply.append(next_hint)
     return "\n".join([r for r in reply if r is not None]).strip()
 
 
-def _format_chunk(c: Dict[str, Any], teacher_profile: Dict[str, Any]) -> Dict[str, Any]:
+def _format_chunk(c: Dict[str, Any], teacher_profile: Dict[str, Any], student_state: Dict[str, Any]) -> Dict[str, Any]:
     chunk_type = (c.get("type") or "chunk")
     if isinstance(chunk_type, str):
         chunk_type = chunk_type.strip() or "chunk"
@@ -380,12 +549,13 @@ def _format_chunk(c: Dict[str, Any], teacher_profile: Dict[str, Any]) -> Dict[st
     raw_title = (c.get("title") or "").strip()
     raw_text = ((c.get("chunk_text") or c.get("text")) or "").strip()
 
-    if chunk_type in ("chunk", "teaching", "teacher_greeting") or chunk_type is None:
+    if chunk_type in ("chunk", "teaching", "teacher_greeting") or chunk_type is None or chunk_type == "":
         enriched_text = _teach_slowly(
             raw_text=raw_text,
             title=raw_title,
             teacher=teacher_profile,
             chunk_type=chunk_type or "chunk",
+            student_state=student_state,
         )
     else:
         enriched_text = raw_text
@@ -401,6 +571,8 @@ def _format_chunk(c: Dict[str, Any], teacher_profile: Dict[str, Any]) -> Dict[st
         "meta": {
             "teacher_name": teacher_profile.get("teacher_name"),
             "voice_id": teacher_profile.get("voice_id", "default"),
+            # helpful debug for you (non-breaking)
+            "difficulty_level": ((student_state or {}).get("brain_state") or {}).get("difficulty_level", "normal"),
         },
     }
 
@@ -422,7 +594,10 @@ def respond(payload: RespondPayload):
     if not chunks:
         return {"type": "error", "message": "No chunks found for this chapter_id."}
 
-    # MODE C progress: (student_id, chapter_id) ONLY
+    # Current student brain state (B/C)
+    student_state = _get_student_brain_state(payload.student_id)
+
+    # MODE C progress: (student_id, chapter_id)
     current_seq = _get_progress(payload.student_id, payload.chapter_id)
 
     # ── START CLASS ──────────────────────────────────────────────────────────
@@ -430,25 +605,21 @@ def respond(payload: RespondPayload):
         intro = next((c for c in chunks if (c.get("type") == "intro")), None)
         greeting = next((c for c in chunks if (c.get("type") == "teacher_greeting")), None)
 
-        # If new progress -> serve intro if exists
         if current_seq < 0 and intro:
             _set_progress(payload.student_id, payload.chapter_id, int(intro["seq"]))
-            return _format_chunk(intro, teacher)
+            return _format_chunk(intro, teacher, student_state)
 
-        # Serve greeting if not yet served (or if progress behind greeting)
         if greeting and current_seq < int(greeting["seq"]):
             _set_progress(payload.student_id, payload.chapter_id, int(greeting["seq"]))
-            return _format_chunk(greeting, teacher)
+            return _format_chunk(greeting, teacher, student_state)
 
-        # Serve first learning chunk
         first_learning = next((c for c in chunks if (c.get("type") in (None, "", "chunk", "teaching"))), None)
         if first_learning:
             _set_progress(payload.student_id, payload.chapter_id, int(first_learning["seq"]))
-            return _format_chunk(first_learning, teacher)
+            return _format_chunk(first_learning, teacher, student_state)
 
-        # Fallback
         _set_progress(payload.student_id, payload.chapter_id, int(chunks[0]["seq"]))
-        return _format_chunk(chunks[0], teacher)
+        return _format_chunk(chunks[0], teacher, student_state)
 
     # ── NEXT CHUNK ───────────────────────────────────────────────────────────
     if payload.action == "next":
@@ -456,7 +627,7 @@ def respond(payload: RespondPayload):
         if not nxt:
             return {"type": "end", "message": "Chapter completed ✅"}
         _set_progress(payload.student_id, payload.chapter_id, int(nxt["seq"]))
-        return _format_chunk(nxt, teacher)
+        return _format_chunk(nxt, teacher, student_state)
 
     # ── ANSWER QUIZ ──────────────────────────────────────────────────────────
     if payload.action == "answer_quiz":
@@ -476,16 +647,29 @@ def respond(payload: RespondPayload):
             "explanation": quiz.get("explanation") or "",
         }
 
-    # ── RESPOND ──────────────────────────────────────────────────────────────
+    # ── RESPOND (B + C) ──────────────────────────────────────────────────────
     student_text = (payload.student_input or "").strip()
     if not student_text:
         return {"type": "error", "message": "student_input required for respond"}
 
+    # B) infer signals + update lifelong brain
+    signals = _infer_learning_signals(student_text)
+    signals["last_student_text"] = student_text
+    _update_student_state(payload.student_id, signals)
+
+    # Refresh state (so C adapts immediately)
+    student_state = _get_student_brain_state(payload.student_id)
+
     current_chunk = _find_by_seq(chunks, current_seq)
-    reply = _teacher_reply(student_text, current_chunk, teacher)
+    reply = _teacher_reply(student_text, current_chunk, teacher, student_state)
 
     return {
         "type": "teacher_reply",
         "reply": reply,
-        "meta": {"teacher_name": teacher.get("teacher_name")},
+        "meta": {
+            "teacher_name": teacher.get("teacher_name"),
+            "difficulty_level": ((student_state or {}).get("brain_state") or {}).get("difficulty_level", "normal"),
+            "stress_score": (student_state or {}).get("stress_score", 50),
+            "confidence_score": (student_state or {}).get("confidence_score", 50),
+        },
     }

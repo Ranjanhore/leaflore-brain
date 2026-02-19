@@ -17,7 +17,12 @@ app = FastAPI(title="Leaflore Brain", version="3.2.0")
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=[
+        "https://leaf-lore-chapters-story.lovable.app",
+        "https://*.lovable.app",
+        "http://localhost:5173",
+        "http://localhost:3000",
+    ],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],

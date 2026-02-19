@@ -17,6 +17,8 @@ app = FastAPI(title="Leaflore Brain", version="3.2.0")
 
 from fastapi.middleware.cors import CORSMiddleware
 
+from fastapi.middleware.cors import CORSMiddleware
+
 app.add_middleware(
     CORSMiddleware,
     allow_origins=[
@@ -26,6 +28,7 @@ app.add_middleware(
         "http://localhost:5173",
         "http://localhost:3000",
     ],
+    allow_origin_regex=r"https:\/\/.*\.lovable\.dev",
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],

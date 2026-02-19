@@ -15,6 +15,8 @@ from supabase import create_client, Client
 
 app = FastAPI(title="Leaflore Brain", version="3.2.0")
 
+from fastapi.middleware.cors import CORSMiddleware
+
 app.add_middleware(
     CORSMiddleware,
     allow_origins=[

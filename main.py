@@ -19,7 +19,7 @@ app.add_middleware(
     CORSMiddleware,
     allow_origins=[
         "https://leaf-lore-chapters-story.lovable.app",
-        "https://*.lovable.app",
+        "https://leaf-lore-chapters-story.lovableproject.com",
         "http://localhost:5173",
         "http://localhost:3000",
     ],

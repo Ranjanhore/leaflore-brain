@@ -15,24 +15,25 @@ from supabase import create_client, Client
 
 app = FastAPI(title="Leaflore Brain", version="3.2.0")
 
-from fastapi import FastAPI
-from fastapi.middleware.cors import CORSMiddleware
-
-app = FastAPI(title="Leaflore Brain", version="3.2.0")
-
+# ✅ Single, correct CORS middleware (handles OPTIONS preflight)
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=[
-        "https://lovable.dev",
-        "https://leaf-lore-chapters-story.lovable.app",
-        "https://leaf-lore-chapters-story.lovableproject.com",
-        "http://localhost:5173",
-        "http://localhost:3000",
-    ],
-    allow_credentials=False,   # IMPORTANT with allow_origins list
-    allow_methods=["*"],
+    # Allows:
+    # - lovable.app subdomains (published)
+    # - lovableproject.com subdomains (published variants)
+    # - lovable.dev (editor/preview)
+    # - localhost (dev)
+    allow_origin_regex=r"^https://(.*\.)?lovable\.app$|^https://(.*\.)?lovableproject\.com$|^https://lovable\.dev$|^http://localhost(:\d+)?$",
+    allow_credentials=False,   # keep False unless you use cookies/auth sessions
+    allow_methods=["*"],       # includes OPTIONS + POST
     allow_headers=["*"],
+    max_age=86400,
 )
+
+@app.get("/health")
+def health():
+    return {"status": "ok"}
+
 @app.get("/debug")
 def debug():
     return {"ok": True}
@@ -53,7 +54,6 @@ if not SUPABASE_URL or not SUPABASE_KEY:
 
 supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
 
-
 # ─────────────────────────────────────────────────────────────
 # Models
 # ─────────────────────────────────────────────────────────────
@@ -67,7 +67,6 @@ class RespondPayload(BaseModel):
     chapter_id: str
     student_input: Optional[str] = None
     quiz_answer: Optional[str] = None
-
 
 # ─────────────────────────────────────────────────────────────
 # Teacher Profile
@@ -103,7 +102,6 @@ def _get_teacher_profile(chapter_id: str) -> Dict[str, Any]:
 
     return profile
 
-
 # ─────────────────────────────────────────────────────────────
 # Chunk Helpers
 # ─────────────────────────────────────────────────────────────
@@ -130,7 +128,6 @@ def _find_next(chunks: List[Dict[str, Any]], seq: int):
         if int(c.get("seq") or 0) > int(seq):
             return c
     return None
-
 
 # ─────────────────────────────────────────────────────────────
 # Lifelong Brain
@@ -192,7 +189,6 @@ def _update_student_brain(student_id: str, student_text: str):
     except Exception:
         pass
 
-
 # ─────────────────────────────────────────────────────────────
 # Progress (Per Chapter)
 # ─────────────────────────────────────────────────────────────
@@ -224,7 +220,6 @@ def _set_progress(student_id: str, chapter_id: str, seq: int):
     except Exception:
         pass
 
-
 # ─────────────────────────────────────────────────────────────
 # Learning Signals
 # ─────────────────────────────────────────────────────────────
@@ -255,14 +250,12 @@ def _infer_learning_signals(text: str) -> Dict[str, Any]:
         "confidence_score": _clamp(confidence),
     }
 
-
 # ─────────────────────────────────────────────────────────────
 # Teaching Engine
 # ─────────────────────────────────────────────────────────────
 
 def _teach(text: str, title: str):
     return f"{title}\n\n{text}\n\nPause. Tell me what you understood."
-
 
 def _format_chunk(chunk, teacher):
     return {
@@ -278,14 +271,12 @@ def _format_chunk(chunk, teacher):
         },
     }
 
-
 # ─────────────────────────────────────────────────────────────
 # Endpoint
 # ─────────────────────────────────────────────────────────────
 
 @app.post("/respond")
 def respond(payload: RespondPayload):
-
     _ensure_student_brain_row(payload.student_id)
 
     teacher = _get_teacher_profile(payload.chapter_id)
@@ -324,7 +315,6 @@ def respond(payload: RespondPayload):
             raise HTTPException(status_code=400, detail="student_input required")
 
         _update_student_brain(payload.student_id, payload.student_input)
-
         brain = _get_student_brain_full(payload.student_id)
 
         return {
@@ -340,3 +330,5 @@ def respond(payload: RespondPayload):
             "correct": True,
             "student_brain": _get_student_brain_full(payload.student_id),
         }
+
+    raise HTTPException(status_code=400, detail="Unknown action")

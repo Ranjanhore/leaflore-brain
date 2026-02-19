@@ -20,6 +20,7 @@ from fastapi.middleware.cors import CORSMiddleware
 app.add_middleware(
     CORSMiddleware,
     allow_origins=[
+        "https://lovable.dev",
         "https://leaf-lore-chapters-story.lovable.app",
         "https://leaf-lore-chapters-story.lovableproject.com",
         "http://localhost:5173",

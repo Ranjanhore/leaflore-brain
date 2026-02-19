@@ -15,9 +15,10 @@ from supabase import create_client, Client
 
 app = FastAPI(title="Leaflore Brain", version="3.2.0")
 
+from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
-from fastapi.middleware.cors import CORSMiddleware
+app = FastAPI(title="Leaflore Brain", version="3.2.0")
 
 app.add_middleware(
     CORSMiddleware,
@@ -28,11 +29,11 @@ app.add_middleware(
         "http://localhost:5173",
         "http://localhost:3000",
     ],
-    allow_origin_regex=r"https:\/\/.*\.lovable\.dev",
-    allow_credentials=True,
+    allow_credentials=False,   # IMPORTANT with allow_origins list
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
 
 @app.get("/health")
 def health():

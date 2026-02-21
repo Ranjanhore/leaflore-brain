@@ -1,36 +1,71 @@
 import os
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
+from typing import Optional, Dict
 from openai import OpenAI
 
 app = FastAPI()
 client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
 
-class Req(BaseModel):
-    text: str
-    # optional context fields you can add later:
-    chapter_id: str | None = None
-    chunk_id: str | None = None
+
+# ===== Structured Request =====
+class RespondRequest(BaseModel):
+    student_id: str
+    board: str
+    grade: str
+    subject: str
+    chapter: str
+    concept: str
+    student_input: str
+    signals: Optional[Dict] = None
+    class_phase: Optional[str] = None
+
 
 @app.get("/health")
 def health():
     return {"status": "ok"}
 
+
 @app.post("/respond")
-def respond(req: Req):
-    if not req.text:
-        raise HTTPException(status_code=400, detail="text is required")
+def respond(req: RespondRequest):
+
+    if not req.student_input:
+        raise HTTPException(status_code=400, detail="student_input required")
+
+    # Extract signals safely
+    emotion = req.signals.get("emotion") if req.signals else "neutral"
+    engagement = req.signals.get("engagement") if req.signals else "normal"
+
+    # Dynamic system prompt
+    system_prompt = f"""
+You are Leaflore AI Teacher.
+
+Student Details:
+- Board: {req.board}
+- Grade: {req.grade}
+- Subject: {req.subject}
+- Chapter: {req.chapter}
+- Concept: {req.concept}
+- Emotion: {emotion}
+- Engagement Level: {engagement}
+
+Instructions:
+- Explain slowly like a story.
+- Adjust difficulty to grade {req.grade}.
+- If emotion is confused, simplify.
+- If engagement is low, make it more interactive.
+- Ask one short question at the end.
+"""
 
     r = client.responses.create(
         model="gpt-4o-mini",
         input=[
-            {
-                "role": "system",
-                "content": "You are Leaflore teacher. Explain slowly like a story. Ask 1 short question at the end."
-            },
-            {"role": "user", "content": req.text},
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": req.student_input},
         ],
+        max_output_tokens=400,
     )
-    # safest extraction
+
     out = r.output_text if hasattr(r, "output_text") else ""
+
     return {"text": out}
